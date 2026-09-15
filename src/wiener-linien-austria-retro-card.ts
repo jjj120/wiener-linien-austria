@@ -11,8 +11,7 @@ import type {
 
 import { RETRO_CARD_VERSION } from "./const.js";
 import { deText } from "./utils.js";
-import { LINE_TYPE_METRO } from "./utils/mot.js";
-import { translate } from "./localize/localize.js";
+import { pickerText, translate } from "./localize/localize.js";
 import {
   checkCardVersionWS,
   renderVersionBanner,
@@ -23,7 +22,8 @@ import type {
   WienerLinienRetroCardConfig,
 } from "./types.js";
 import { chipPalette, normaliseRetroConfig, type NormalisedRetroConfig } from "./utils/config.js";
-import { filterDepartures } from "./utils/departures.js";
+import { filterDepartures, stubDirection } from "./utils/departures.js";
+import { deriveRetroView } from "./utils/retro-view.js";
 import { findWienerLinienEntities } from "./utils/entities.js";
 import type { LineColorsMap } from "./types.js";
 import { registerWlFonts } from "./font-face.js";
@@ -80,11 +80,11 @@ const MESSAGE_TICKER_RACE_DEFER_MS = 20_000;
 {
   const win = window as unknown as WindowWithCustomCards;
   win.customCards = win.customCards ?? [];
-  if (!win.customCards.some((c) => c["type"] === "wiener-linien-austria-retro-card")) {
+  if (!win.customCards.some((c) => c.type === "wiener-linien-austria-retro-card")) {
     win.customCards.push({
       type: "wiener-linien-austria-retro-card",
       name: "Wiener Linien Austria — Retro",
-      description: "LED-Anzeige im Stil der Wiener-Linien-Stationen",
+      description: pickerText("picker_retro"),
       preview: true,
       // HA 2026.6 entity-first picker: only suggest this card for
       // sensors owned by this integration. Older HA ignores the key.
@@ -167,6 +167,20 @@ export class WienerLinienAustriaRetroCard extends LitElement {
         "wiener-linien-austria-retro-card: 'entity' must be a string",
       );
     }
+    // Reject a wrong-domain entity loudly. The normaliser would silently
+    // drop it to `undefined` and the panel would render blank, which a
+    // user cannot tell apart from "no departures right now". The empty
+    // string stays allowed — that is the entity picker's stub state, and
+    // the editor has to be able to load on it.
+    if (
+      typeof config.entity === "string" &&
+      config.entity &&
+      !config.entity.startsWith("sensor.")
+    ) {
+      throw new Error(
+        `wiener-linien-austria-retro-card: 'entity' must be in the sensor domain (got "${config.entity}")`,
+      );
+    }
     this._config = normaliseRetroConfig(config);
     // Reset every timer / state-machine handle on config swap. Without
     // this, toggling `wheelchair_race` off mid-race leaves a victory
@@ -221,15 +235,7 @@ export class WienerLinienAustriaRetroCard extends LitElement {
     const first = entities[0] || "";
     // Default direction: prefer whichever side has departures right now so
     // the Lovelace preview renders with data instead of an empty LED board.
-    let direction: "H" | "R" = "H";
-    const deps = hass?.states?.[first]?.attributes?.departures as
-      | DepartureAttr[]
-      | undefined;
-    if (Array.isArray(deps)) {
-      const hasH = deps.some((d) => d.direction === "H");
-      const hasR = deps.some((d) => d.direction === "R");
-      if (!hasH && hasR) direction = "R";
-    }
+    const direction = stubDirection(hass?.states?.[first]?.attributes?.departures);
     return {
       entity: first,
       direction,
@@ -253,14 +259,12 @@ export class WienerLinienAustriaRetroCard extends LitElement {
       document.fonts.ready
         .then(() => {
           if (!document.fonts.check('700 16px "WL Mono"')) {
-            // eslint-disable-next-line no-console
             console.warn(
               '[wiener-linien-austria-retro-card] "WL Mono" 700 not loaded — falling back to Courier New (less authentic). Check /wiener-linien-austria/fonts/ is served by the integration.',
             );
           }
         })
         .catch((err) => {
-          // eslint-disable-next-line no-console
           console.warn(
             "[wiener-linien-austria-retro-card] document.fonts.ready rejected",
             err,
@@ -383,19 +387,12 @@ export class WienerLinienAustriaRetroCard extends LitElement {
   }
 
   private async _checkCardVersion(): Promise<void> {
-    try {
-      this._versionMismatch = await checkCardVersionWS(
-        this.hass,
-        "wiener_linien_austria/retro_card_version",
-        RETRO_CARD_VERSION,
-      );
-    } catch (err) {
-      // eslint-disable-next-line no-console
-      console.warn(
-        "[wiener-linien-austria-retro-card] version probe failed",
-        err,
-      );
-    }
+    // checkCardVersionWS never rejects, so there is nothing to catch here.
+    this._versionMismatch = await checkCardVersionWS(
+      this.hass,
+      "wiener_linien_austria/retro_card_version",
+      RETRO_CARD_VERSION,
+    );
   }
 
   /** Cache-aware: returns the configured entity if it's in hass.states,
@@ -421,7 +418,6 @@ export class WienerLinienAustriaRetroCard extends LitElement {
       // fallback keeps the card useful, but make the swap auditable so
       // the user notices their dashboard is now showing a different stop.
       this._fallbackWarned = true;
-      // eslint-disable-next-line no-console
       console.warn(
         `[wiener-linien-austria-retro-card] configured entity "${configured}" not in hass.states; falling back to "${first}"`,
       );
@@ -709,10 +705,11 @@ export class WienerLinienAustriaRetroCard extends LitElement {
   //      home stretch.
   //   4. Pick a swap pattern matching that constraint (the pattern
   //      still drives mid-race overtakes for visual storytelling).
-  //   5. Measure each wheelchair's natural start x (cqw).
+  //   5. Measure each wheelchair's natural start x and the finish line
+  //      (cqw; RACE_FINISH_X_FALLBACK_CQW when the finish can't be measured).
   //   6. Compute absolute target x at each checkpoint per racer.
-  //   7. Solve for each racer's exit position so they cross
-  //      RACE_FINISH_X_CQW at their target time. Clamped — extremes
+  //   7. Solve for each racer's exit position so they cross the
+  //      finish line at their target time. Clamped — extremes
   //      just under-/overshoot the intended margin.
   //   8. Recompute actual cross times from the clamped trajectories
   //      and assign _raceWinner from those, so announced == visible.
@@ -814,41 +811,19 @@ export class WienerLinienAustriaRetroCard extends LitElement {
     const cfg = this._config;
     const eid = this._resolveEntity();
     const attrs = (eid ? (this.hass?.states?.[eid]?.attributes ?? {}) : {}) as WienerLinienAttrs;
-    const departures = Array.isArray(attrs.departures) ? attrs.departures : [];
+    // What to show is derived in utils/retro-view.ts (pure, unit-tested);
+    // this method only decides how to draw it.
+    const {
+      rows,
+      matching,
+      departures,
+      platform,
+      gleisLeft,
+      platformLabelKey,
+      stopName,
+    } = deriveRetroView(cfg, attrs);
+    const platformLabel = this._t(platformLabelKey);
 
-    const matching = filterDepartures(departures, {
-      direction: cfg.direction,
-      lines: cfg.line ? [cfg.line] : undefined,
-      walk_times: cfg.walk_times,
-      accessibility_only: cfg.accessibility_only,
-    });
-    const rows = matching.slice(0, 2);
-
-    const rawPlatform = rows.find((d) => d.platform)?.platform ?? null;
-    const platform = cfg.show_platform ? rawPlatform : null;
-    // Side resolution: explicit user override wins over the auto rule
-    // (platform "2" lands on the left, else right — the U-Bahn signage
-    // convention). "auto" preserves pre-feature behaviour; "left" /
-    // "right" let users mirror a real-station view that disagrees
-    // with the heuristic (e.g. a tram stop where the published platform
-    // is "1" but the user wants the GLEIS column on the left for
-    // consistency with the next card on their dashboard).
-    let gleisLeft: boolean;
-    switch (cfg.platform_side) {
-      case "left":
-        gleisLeft = true;
-        break;
-      case "right":
-        gleisLeft = false;
-        break;
-      default:
-        gleisLeft = platform === "2";
-    }
-    const type = rows[0]?.type ?? "";
-    const isMetro = type === LINE_TYPE_METRO;
-    const platformLabel = this._t(isMetro ? "gleis" : "steig");
-
-    const stopName = attrs.stop_name || attrs.friendly_name || "";
     const showStationName = cfg.show_station_name && !!stopName;
     const stationPanel = showStationName
       ? this._renderStationName(
@@ -899,7 +874,7 @@ export class WienerLinienAustriaRetroCard extends LitElement {
       "retro--race-freeze": raceFreeze,
       "retro--race-victory": raceVictory,
       "retro--clickable": clickable,
-      "retro--line-pill": cfg.line_pill,
+      "retro--line-pill": cfg.show_line_pill,
       "retro--line-stripe": cfg.line_stripe,
       "retro--housing": cfg.housing,
     };
@@ -1030,15 +1005,7 @@ export class WienerLinienAustriaRetroCard extends LitElement {
     const line = d.line || "?";
     const towards = d.towards || "";
     const via = typeof d.via === "string" && d.via.trim() ? d.via.trim() : null;
-    const cdLabel =
-      cd === null
-        ? this._t("no_data")
-        : isAtPlatform
-          ? this._t("at_platform")
-          : this._t("countdown_minutes", { n: String(cd) });
-    const a11yLabel = d.barrier_free ? this._t("barrier_free_title") : "";
-    const viaA11y = via ? `${this._t("via_prefix")} ${via}` : "";
-    const rowLabel = [line, towards, viaA11y, cdLabel, a11yLabel].filter(Boolean).join(" — ");
+    const rowLabel = this._rowLabel(d, line, towards, via);
     // Resolve the line's WL palette through the same precedence ladder
     // chips use elsewhere: GTFS routes.txt first, then the nightline
     // override, then a CSS-var fallback that doesn't read well on the
@@ -1094,6 +1061,13 @@ export class WienerLinienAustriaRetroCard extends LitElement {
                 `
               : nothing}
           </span>
+          ${d.timetable
+            ? html`<ha-icon
+                class="retro-timetable"
+                icon="mdi:calendar-clock"
+                title=${this._t("timetable_title")}
+              ></ha-icon>`
+            : nothing}
           ${d.barrier_free
             ? html`<ha-icon
                 class="retro-wheelchair"
@@ -1113,6 +1087,29 @@ export class WienerLinienAustriaRetroCard extends LitElement {
         </div>
       </li>
     `;
+  }
+
+  /** What a screen reader hears for a row, since the LED cells themselves
+   *  are hidden from it: line, destination, via, countdown, then the
+   *  timetable and step-free notes where they apply. */
+  private _rowLabel(d: DepartureAttr, line: string, towards: string, via: string | null): string {
+    const cd = Number.isFinite(d.countdown) ? d.countdown : null;
+    const cdLabel =
+      cd === null
+        ? this._t("no_data")
+        : cd <= 0
+          ? this._t("at_platform")
+          : this._t("countdown_minutes", { n: String(cd) });
+    return [
+      line,
+      towards,
+      via ? `${this._t("via_prefix")} ${via}` : "",
+      cdLabel,
+      d.timetable ? this._t("timetable_title") : "",
+      d.barrier_free ? this._t("barrier_free_title") : "",
+    ]
+      .filter(Boolean)
+      .join(" — ");
   }
 
   private _renderGleis(platform: string, label: string): TemplateResult {
@@ -1435,7 +1432,10 @@ export class WienerLinienAustriaRetroCard extends LitElement {
     .retro-dest-text--visible {
       opacity: 1;
     }
-    .retro-wheelchair {
+    /* The timetable pictogram marks a planned S-Bahn row (no live time)
+       and shares the wheelchair's sizing and optical-centre nudge. */
+    .retro-wheelchair,
+    .retro-timetable {
       flex: 0 0 auto;
       display: inline-flex;
       align-items: center;

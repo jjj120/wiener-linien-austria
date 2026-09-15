@@ -11,22 +11,34 @@ import type { WienerLinienAttrs } from "../types.js";
 // substring match on `attribution.includes("wiener linien")` could
 // false-positive on any third-party integration whose attribution
 // happened to mention Wiener Linien (e.g. a custom dashboard widget,
-// a derived template sensor). The structural keys are emitted by
-// our coordinator's `_attr_extra_state_attributes` and are unique to
-// our sensor shape.
+// a derived template sensor). The structural keys come from the stop
+// sensor's `extra_state_attributes` property (sensor.py) and are unique
+// to our sensor shape.
 export function findWienerLinienEntities(hass: HomeAssistant | undefined): string[] {
+  return findSensors<WienerLinienAttrs>(
+    hass,
+    (attrs) =>
+      typeof attrs.diva === "number" &&
+      Array.isArray(attrs.departures) &&
+      !!attrs.next_by_line &&
+      typeof attrs.next_by_line === "object",
+  );
+}
+
+/** Sensor entity ids whose attributes pass `matches`, sorted. The walk the
+ *  stop and route cards share; each supplies its own fingerprint, which is
+ *  the part that must keep the two from picking up each other's sensors. */
+export function findSensors<Attrs>(
+  hass: HomeAssistant | undefined,
+  matches: (attrs: Partial<Attrs>) => boolean,
+): string[] {
   if (!hass) return [];
-  const matches: string[] = [];
+  const found: string[] = [];
   for (const [eid, state] of Object.entries(hass.states ?? {})) {
     if (!eid.startsWith("sensor.")) continue;
-    const attrs = (state?.attributes ?? {}) as WienerLinienAttrs;
-    if (typeof attrs.diva !== "number") continue;
-    if (!Array.isArray(attrs.departures)) continue;
-    if (!attrs.next_by_line || typeof attrs.next_by_line !== "object") continue;
-    matches.push(eid);
+    if (matches((state?.attributes ?? {}) as Partial<Attrs>)) found.push(eid);
   }
-  matches.sort();
-  return matches;
+  return found.sort();
 }
 
 // `line_colors` map for a single entity; empty `{}` when missing or
@@ -42,19 +54,33 @@ export function lineColorsFor(
   return attrs?.line_colors ?? {};
 }
 
-// First non-empty `line_colors` map across the supplied entities. Every
-// WL sensor publishes the same GTFS palette, so the first hit is enough
-// to seed render paths that aren't scoped to a single stop. Returns
-// `{}` when nothing matches so callers can `Object.keys(...).length`
-// without a null guard.
-export function firstLineColorsMap(
+// Union of the `line_colors` maps across the supplied entities, for the
+// render paths that aren't scoped to a single stop: the flap board's
+// card-wide palette, traffic/elevator notice badges aggregated over
+// every configured stop, and the editor's colour picker.
+//
+// This used to be `firstLineColorsMap` — first non-empty map wins —
+// which was correct only while every sensor published the identical
+// full GTFS catalogue (179 lines, ~7 KB, byte-for-byte the same on
+// every entity). As of v2.0.0 each sensor publishes only the lines it
+// can actually be asked to colour, so two stops legitimately carry
+// different maps and taking one of them would paint the other's lines
+// with the neutral fallback. Merging is also what the old code MEANT:
+// it assumed one map covered every stop on the card.
+//
+// Earlier entities win on key collision, which is arbitrary and safe —
+// the values come from the same GTFS `routes.txt` for every stop, so a
+// collision is the same colour twice.
+export function mergeLineColorsMaps(
   hass: HomeAssistant | undefined,
   entityIds: ReadonlyArray<string>,
 ): NonNullable<WienerLinienAttrs["line_colors"]> {
   if (!hass) return {};
+  const merged: Record<string, { bg: string; fg?: string }> = {};
   for (const eid of entityIds) {
-    const colors = lineColorsFor(hass, eid);
-    if (Object.keys(colors).length) return colors;
+    for (const [label, palette] of Object.entries(lineColorsFor(hass, eid))) {
+      if (!(label in merged)) merged[label] = palette;
+    }
   }
-  return {};
+  return merged;
 }

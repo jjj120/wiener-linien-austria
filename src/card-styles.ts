@@ -14,12 +14,10 @@ import { css } from "lit";
 // so it stays a consistent, theme-owned affordance rather than shifting hue
 // per station.
 //
-// Webfonts (WL Sans / WL Sans Condensed / WL Mono) are NOT declared
-// here: `@font-face` inside Shadow DOM is unreliable on older engines
-// (Android System WebView). `registerWlFonts()` from `./font-face`
-// injects the faces on `document.head` instead — the card just
-// references the families by name. See font-face.ts / www/fonts/
-// NOTICE.md for the rationale, provenance + GUST Font License terms.
+// Webfonts (WL Sans / WL Sans Condensed / WL Mono) are NOT declared here —
+// `registerWlFonts()` injects them on `document.head` instead, and the card
+// just references the families by name. See font-face.ts for why Shadow DOM
+// cannot hold them, and www/fonts/NOTICE.md for provenance + licence.
 export const cardStyles = css`
   :host {
     /* color-scheme enables light-dark() and steers forced-colors
@@ -172,12 +170,103 @@ export const cardStyles = css`
     padding: 0 14px;
     border-bottom: 1px solid var(--divider-color, rgba(255, 255, 255, 0.12));
   }
+  /* Holds the scroller and the two arrows laid over its ends. The arrows
+     are absolutely positioned, so one appearing never changes the width
+     the tabs get and nothing re-flows while scrolling. */
+  .tabs-viewport {
+    /* The arrow's own width is fully clear, so its chevron never sits on
+       top of letters; the fade runs from there to --wl-tab-fade. */
+    --wl-tab-clear: 26px;
+    --wl-tab-fade: 56px;
+    position: relative;
+    display: flex;
+    flex: 1;
+    min-width: 0;
+  }
   .tabs {
+    position: relative;
     display: flex;
     flex: 1;
     min-width: 0;
     overflow-x: auto;
     scrollbar-width: none;
+    overscroll-behavior-x: contain;
+    /* The fade is the "more this way" signal; it only exists on a side
+       that hides tabs. A 0px stop is a hard edge, i.e. no fade. */
+    --wl-clear-start: 0px;
+    --wl-clear-end: 0px;
+    --wl-fade-start: 0px;
+    --wl-fade-end: 0px;
+    mask-image: linear-gradient(
+      to right,
+      transparent 0,
+      transparent var(--wl-clear-start),
+      #000 var(--wl-fade-start),
+      #000 calc(100% - var(--wl-fade-end)),
+      transparent calc(100% - var(--wl-clear-end)),
+      transparent 100%
+    );
+  }
+  .fade-start .tabs {
+    --wl-clear-start: var(--wl-tab-clear);
+    --wl-fade-start: var(--wl-tab-fade);
+  }
+  .fade-end .tabs {
+    --wl-clear-end: var(--wl-tab-clear);
+    --wl-fade-end: var(--wl-tab-fade);
+  }
+  .tabs:dir(rtl) {
+    mask-image: linear-gradient(
+      to left,
+      transparent 0,
+      transparent var(--wl-clear-start),
+      #000 var(--wl-fade-start),
+      #000 calc(100% - var(--wl-fade-end)),
+      transparent calc(100% - var(--wl-clear-end)),
+      transparent 100%
+    );
+  }
+  .tab-scroll {
+    position: absolute;
+    top: 50%;
+    z-index: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    border: none;
+    border-radius: 50%;
+    background: transparent;
+    color: var(--secondary-text-color);
+    cursor: pointer;
+    opacity: 0;
+    pointer-events: none;
+    transform: translateY(-50%);
+    transition: opacity var(--ha-animation-duration-fast, 150ms) ease, background-color var(--ha-animation-duration-fast, 150ms) ease, color var(--ha-animation-duration-fast, 150ms) ease;
+  }
+  .tab-scroll--start {
+    inset-inline-start: -6px;
+  }
+  .tab-scroll--end {
+    inset-inline-end: -6px;
+  }
+  .tab-scroll.visible {
+    opacity: 1;
+    pointer-events: auto;
+  }
+  .tab-scroll:hover {
+    background: color-mix(in srgb, var(--primary-color) 12%, transparent);
+    color: var(--primary-text-color);
+  }
+  .tab-scroll ha-icon {
+    --mdc-icon-size: 20px;
+    display: flex;
+  }
+  .tab-scroll--start ha-icon:dir(rtl),
+  .tab-scroll--end ha-icon:dir(rtl) {
+    transform: scaleX(-1);
   }
   .tabs::-webkit-scrollbar {
     display: none;
@@ -310,6 +399,13 @@ export const cardStyles = css`
     display: inline-flex;
     align-items: center;
     justify-content: center;
+    box-sizing: border-box;
+    flex: 0 0 auto;
+    /* The QR toggle is a <button>, the maps link an <a>: without this
+       reset the button keeps its UA padding and the two boxes disagree,
+       so the round hover surface stops being a circle centred on the
+       glyph. */
+    padding: 0;
     width: 40px;
     height: 40px;
     border-radius: 50%;
@@ -324,8 +420,19 @@ export const cardStyles = css`
     background: color-mix(in srgb, var(--primary-color) 12%, transparent);
     color: var(--primary-text-color);
   }
+  /* Same inline-baseline correction as .hero-a11y: ha-icon is
+     inline-level, so the ha-svg-icon inside it sits on a text baseline
+     and reserves descender space below the glyph. Inside a round
+     button that lifts the icon above true centre and the hover circle
+     reads as misaligned. Sizing ha-icon as a flex box of exactly the
+     glyph's size removes the line box, and with it the offset. */
   .icon-action ha-icon {
     --mdc-icon-size: 20px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: var(--mdc-icon-size);
+    height: var(--mdc-icon-size);
   }
 
   /* Hero block — Linz-Linien-aligned layout: tinted background, big
@@ -339,9 +446,22 @@ export const cardStyles = css`
     display: grid;
     grid-template-columns: auto 1fr;
     column-gap: var(--ha-space-3, 12px);
-    /* Named so the hero connector stub can bridge it. */
+    /* Named so the hero connector stub can bridge it, and so the item
+       margins below can reuse the one value. */
     --wl-hero-row-gap: 6px;
-    row-gap: var(--wl-hero-row-gap);
+    /* Spacing lives on the items, NOT on the track gap. An expandable
+       entry always emits a .hero-detail panel; collapsed, that panel is
+       a zero-height grid row, so a row-gap would apply above AND below
+       it and leave two gaps between the entries it separates, while an
+       entry without stops_ahead emits no panel and got one. Two heroes
+       on the same dashboard then measured differently.
+
+       A negative margin on the panel does NOT fix this: a margin changes
+       an item's contribution to its own track, never the fixed space
+       the grid inserts between tracks. Only removing the gap does. This
+       is the same reason .dep-list spaces its rows with padding and
+       borders rather than a gap. */
+    row-gap: 0;
     align-items: center;
     /* Cosmetics (background, padding, radius) live on .hero-host so
        the tinted surface visually contains both the grid and any
@@ -355,9 +475,45 @@ export const cardStyles = css`
   .hero > .hero-time {
     grid-column: 1;
     grid-row: 1;
+    /* The metric (2.5rem on wide cards) is taller than an entry, so it
+       sized grid row 1 and left the first entry reading ~7px further
+       from the second than every other pair in the trail. Symmetric
+       negative margins cancel its own height, so it contributes nothing
+       to the row while the glyphs stay put: they overflow equally up
+       into hero-host's padding and down into column 1, which is empty
+       on every row below. Nothing clips them — ha-card is the only
+       overflow: hidden ancestor and it wraps the whole card.
+
+       Not height: 0 — this is a baseline flex line, and collapsing the
+       box makes its content hang below the box rather than stay centred
+       on it — which dropped the countdown well under the badge on a
+       one-entry hero, where there was no second row to disguise it.
+       Margins shrink the box's footprint without moving its content.
+       Halving --wl-metric-size slightly over-shrinks (the line box can
+       exceed the font size), and over-shrinking is the safe direction:
+       the row falls back to entry height and the box stays centred. */
+    align-self: center;
+    margin-block: calc(var(--wl-metric-size) / -2);
+    /* Optical correction. Centring the BOX is not centring the INK:
+       wl-sans-bold (TeX Gyre Heros, 1000 upm) declares hhea ascent 1125
+       / descent -307 and leaves USE_TYPO_METRICS off, so browsers use
+       those. Under line-height: 1 that puts the baseline 0.909em below
+       the line-box top, and the ink of "Jetzt" (yMax 729, yMin -12)
+       centres 0.0505em BELOW the box centre — about 2px low at 2.5rem,
+       which is what a one-entry hero shows plainly. Digits measure
+       0.047em to 0.0545em, so one constant covers every value the
+       metric renders. A transform rather than a margin: it must not
+       feed back into row sizing. */
+    translate: 0 calc(var(--wl-metric-size) * -0.05);
   }
   .hero > .hero-entry {
     grid-column: 2;
+  }
+  /* Every entry but the first carries the gap above it. A closed panel
+     between two entries adds nothing, so the spacing is identical
+     whether or not the stop has trail data. */
+  .hero > .hero-entry ~ .hero-entry {
+    margin-top: var(--wl-hero-row-gap);
   }
   /* Detail panel spans both columns so its dot column starts at the
      hero-host's left padding — long station names get the full inner
@@ -437,7 +593,16 @@ export const cardStyles = css`
   .hero-detail {
     display: grid;
     grid-template-rows: 0fr;
-    transition: grid-template-rows 0.24s ease;
+    transition:
+      grid-template-rows 0.24s ease,
+      margin-top 0.24s ease;
+    /* Closed, this panel is a zero-height row that must cost nothing —
+       .hero carries no row-gap (see there), so it doesn't. Open, it
+       buys its own gap below the entry it belongs to; the entry after
+       it already carries one. Transitioned with grid-template-rows so
+       the gap grows with the panel instead of snapping at frame one,
+       and so the connector stub (which reaches exactly one gap past the
+       entry's bottom edge) always meets the trail's top. */
   }
   .hero-detail-inner {
     overflow: hidden;
@@ -445,6 +610,7 @@ export const cardStyles = css`
   }
   .hero-detail.expanded {
     grid-template-rows: 1fr;
+    margin-top: var(--wl-hero-row-gap);
   }
   .hero-direction {
     font-weight: 500;
@@ -471,6 +637,30 @@ export const cardStyles = css`
       var(--primary-text-color) 10%,
       transparent
     );
+  }
+  /* Planned S-Bahn departure: the countdown runs off the timetable, not a
+     live feed. Text rather than an icon-only badge, because "no live data"
+     is the one thing here nobody can guess from a glyph. Secondary text
+     colour: it qualifies the time, it isn't a warning. */
+  .hero-timetable {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: var(--ha-font-size-xs, 10px);
+    font-weight: 500;
+    color: var(--secondary-text-color);
+    white-space: nowrap;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: color-mix(
+      in srgb,
+      var(--primary-text-color) 10%,
+      transparent
+    );
+  }
+  .hero-timetable ha-icon {
+    --mdc-icon-size: 12px;
+    display: flex;
   }
   /* Hero status flags — icon-only badges on the next departure, each
      rendered only when its condition holds AND the user enabled it
@@ -1199,6 +1389,21 @@ export const cardStyles = css`
     margin-right: 4px;
     vertical-align: 1px;
   }
+  /* Sits in the same wrap slot as .delay; see .hero-timetable. */
+  .timetable-note {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    color: var(--secondary-text-color);
+    font-size: 0.85rem;
+    font-weight: 500;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .timetable-note ha-icon {
+    --mdc-icon-size: 14px;
+    display: flex;
+  }
   .delay {
     color: var(--wl-warning);
     font-size: 0.85rem;
@@ -1547,7 +1752,20 @@ export const cardStyles = css`
       display: flex;
       flex-direction: column;
       align-items: stretch;
-      gap: 6px;
+      /* No gap here either — flex spaces a zero-height closed panel
+         exactly the way grid does. The item margins carry it. */
+    }
+    /* The negative margins above are a grid-row-sizing fix. Here the
+       hero is a flex column, the countdown is its own stacked line, and
+       it must take its natural footprint and full width back — left as
+       is, the margins would pull the entry below up into it. Selector is
+       kept at .hero > .hero-time: a container query adds no specificity,
+       so a bare .hero-time would lose to the base rule. */
+    .hero > .hero-time {
+      align-self: stretch;
+      /* Stacked above the first entry, so it buys the gap the entry's
+         own ~ rule doesn't give it (that rule skips the first entry). */
+      margin-block: 0 var(--wl-hero-row-gap);
     }
   }
 
@@ -1626,9 +1844,10 @@ export const cardStyles = css`
          row actually ends; the flex content inside stays centred, so the
          badge does not move and top: 50% is still its centre.
 
-         This also closes the slack that made the first line look like it
-         had more space beneath it than the others — the trail now starts
-         directly under it either way. */
+         Since .hero-time's negative margins cancel its footprint this
+         is a no-op in practice — row 1 is now entry-height like the
+         rest. Kept as a guard so the stub still lands correctly if
+         anything ever makes row 1 taller than its entry again. */
       align-self: stretch;
     }
     .hero-detail .stops-ahead {
@@ -1687,7 +1906,15 @@ export const cardStyles = css`
     outline-offset: 2px;
     border-radius: 6px;
   }
+  /* …except the round icon buttons, which would otherwise take a
+     rounded-rect ring around a circular surface. */
+  .icon-action:focus-visible {
+    border-radius: 50%;
+  }
   @media (forced-colors: active) {
+    .tab-scroll {
+      color: ButtonText;
+    }
     .icon-tile,
     .line-badge,
     .alert,
@@ -1715,8 +1942,7 @@ export const cardStyles = css`
     }
   }
   .dep-row,
-  .hero-host,
-  .alert-row {
+  .hero-host {
     animation: wlRowReveal 360ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
     animation-delay: calc(min(var(--row-i, 0), 6) * 55ms);
   }

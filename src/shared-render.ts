@@ -1,9 +1,10 @@
-// Shared render helpers used by BOTH bundled cards (modern + retro).
+// Shared render helpers used by all four bundled cards (modern + retro
+// + flap + route).
 // Extracted so the version-banner + the WS card-version probe live in
 // one place — each card stays focused on its own rendering rather than
 // carrying its own copy of the integration-upgrade plumbing. Each card
-// passes its own WS probe `type` string and bundle version so the two
-// banners don't cross-fire when both cards sit on the same dashboard.
+// passes its own WS probe `type` string and bundle version so the
+// banners don't cross-fire when several cards sit on the same dashboard.
 //
 // Conventions:
 // - Pure functions: no `this`, take what they need as arguments,
@@ -22,6 +23,8 @@ import type { HomeAssistant } from "./types.js";
  * (i.e. banner should appear), or null otherwise. Silent on transport
  * error — older HA installs without the handler simply don't surface a
  * mismatch, which is correct (cache-buster URL still applies).
+ *
+ * Never rejects: the cards call it bare, without a catch of their own.
  */
 export async function checkCardVersionWS(
   hass: HomeAssistant | undefined,
@@ -33,7 +36,7 @@ export async function checkCardVersionWS(
     const r = await hass.callWS<{ version?: string }>({ type });
     if (r?.version && r.version !== bundleVersion) return r.version;
   } catch {
-    // Silent: older backend without the WS handler.
+    // Older backend without the WS handler — see above.
   }
   return null;
 }
@@ -41,10 +44,8 @@ export async function checkCardVersionWS(
 /**
  * Best-effort cache-storage wipe followed by a hard reload. The reload
  * picks up the freshly-cached JS bundle so the version-mismatch banner
- * clears on next mount. Stamps a sessionStorage flag BEFORE reloading
- * so the next mount can detect a stuck-reload loop (Service Worker /
- * CDN refusing to invalidate) and short-circuit instead of looping the
- * banner forever — see `wasReloadAttemptedFor` below.
+ * clears on next mount. Stamps a sessionStorage flag BEFORE reloading —
+ * see `wasReloadAttemptedFor` below for what reads it.
  */
 export function reloadAfterCacheWipe(forVersion?: string | null): void {
   try {
@@ -108,12 +109,8 @@ export function renderVersionBanner(
   className = "banner",
 ): TemplateResult | typeof nothing {
   if (!mismatch) return nothing;
-  // Stuck-reload anti-loop: if the user already clicked reload for
-  // this exact mismatch in the current tab session and the mismatch
-  // is STILL present, the cache invalidation didn't take effect
-  // (Service Worker, aggressive CDN, or a browser ignoring the
-  // versioned URL). Surface a "stuck" state instead of a second
-  // reload button so the banner can't loop indefinitely.
+  // Reload already tried for this mismatch and it is STILL here — show the
+  // stuck state rather than a second reload button. See wasReloadAttemptedFor.
   if (wasReloadAttemptedFor(mismatch)) {
     const stuckMsg = t("version_reload_stuck");
     return html`

@@ -3,12 +3,6 @@ import { customElement, property, state } from "lit/decorators.js";
 import { classMap } from "lit/directives/class-map.js";
 import { styleMap } from "lit/directives/style-map.js";
 import QrCreator from "qr-creator";
-import {
-  mdiBus,
-  mdiBusStop,
-  mdiSubwayVariant,
-  mdiTram,
-} from "@mdi/js";
 import type {
   HomeAssistant,
   LovelaceCardEditor,
@@ -17,15 +11,16 @@ import type {
 
 import { cardStyles } from "./card-styles.js";
 import { registerWlFonts } from "./font-face.js";
-import { CARD_VERSION, NIGHTLINE_BG } from "./const.js";
-import { translate } from "./localize/localize.js";
+import { ATTRIBUTION_FALLBACK, CARD_VERSION, NIGHTLINE_BG } from "./const.js";
+import { pickerText, translate } from "./localize/localize.js";
 import {
   checkCardVersionWS,
   renderVersionBanner,
 } from "./shared-render.js";
-import { deText, safeHttpsUri } from "./utils.js";
+import { deText } from "./utils.js";
 import {
   LINE_TYPE_METRO,
+  LINE_TYPE_S_BAHN,
   headerIconForType,
   lineTypeIcon,
 } from "./utils/mot.js";
@@ -46,20 +41,26 @@ import {
 } from "./utils/config.js";
 import {
   findWienerLinienEntities,
-  firstLineColorsMap,
+  mergeLineColorsMaps,
   lineColorsFor,
 } from "./utils/entities.js";
 import { filterDepartures, shouldShowStopsAhead } from "./utils/departures.js";
 import { safeDomId, toggleInSet } from "./utils/html.js";
+import { stopMapUrl } from "./utils/map-url.js";
 import {
   iconForElevatorReason,
   parseTrafficNotice,
   splitLocationPath,
   type TrafficNotice,
 } from "./utils/traffic-notice.js";
-import { delayMinutes, formatTime } from "./utils/time.js";
+import { mdiPathForIcon } from "./utils/mdi-paths.js";
+import { arrowStep, revealOffset, tabEdges, type TabEdges } from "./utils/tab-scroll.js";
+import { formatTime } from "./utils/time.js";
+import { deriveRowState } from "./utils/row-state.js";
+import { splitHeroAndRows } from "./utils/hero-group.js";
 import {
   accentTextColor,
+  colorSchemeOf,
   contrastRatio,
   mixOver,
   NEUTRAL_ACCENT_TEXT,
@@ -79,7 +80,7 @@ import "./editor.js";
     win.customCards.push({
       type: "wiener-linien-austria-card",
       name: "Wiener Linien Austria",
-      description: "Abfahrtsmonitor mit Störungen und Aufzugsinfo",
+      description: pickerText("picker_modern"),
       preview: true,
       // HA 2026.6 entity-first picker: only suggest this card for
       // sensors owned by this integration. Older HA ignores the key.
@@ -101,8 +102,13 @@ import "./editor.js";
 
 // Unknown vehicle types fall back to the bus prefix — most Wien stops
 // are bus stops.
+/** Space kept between a revealed tab and the strip's edge: the width of
+ *  the edge fade the scroll arrow sits in. Matches `--wl-tab-fade` in
+ *  card-styles.ts. */
+const TAB_FADE_INSET_PX = 56;
+
 function platformLabelKey(type: string | undefined): string {
-  if (type === LINE_TYPE_METRO) {
+  if (type === LINE_TYPE_METRO || type === LINE_TYPE_S_BAHN) {
     return "platform_short_rail";
   }
   return "platform_short_bus";
@@ -136,6 +142,11 @@ export class WienerLinienAustriaCard extends LitElement {
 
   @state() private _config?: NormalisedModernConfig;
   @state() private _activeTab = 0;
+  // Which ends of the tab strip hide more tabs; drives the edge fades and
+  // the scroll arrows. Both false while the tabs fit.
+  @state() private _tabEdges: TabEdges = { start: false, end: false };
+  private _tabResize: ResizeObserver | null = null;
+  private _observedTabs: HTMLElement | null = null;
   @state() private _versionMismatch: string | null = null;
   @state() private _expandedTraffic = new Set<string>();
   @state() private _expandedElevator = new Set<string>();
@@ -249,8 +260,6 @@ export class WienerLinienAustriaCard extends LitElement {
 
   public override connectedCallback(): void {
     super.connectedCallback();
-    // Register the WL webfaces on document.head — see font-face.ts for
-    // why Shadow-DOM @font-face can't be trusted on Android WebView.
     registerWlFonts();
     // One-shot WS version probe — per-instance, but cheap (HA caches the
     // command registration). Gated by _versionCheckDone so re-adding the
@@ -297,7 +306,15 @@ export class WienerLinienAustriaCard extends LitElement {
   private _resolvedStopsMemo: NormalisedModernStop[] | null = null;
   private _nightlineHourMemo: boolean | null = null;
 
+  public override disconnectedCallback(): void {
+    super.disconnectedCallback();
+    this._tabResize?.disconnect();
+    this._tabResize = null;
+    this._observedTabs = null;
+  }
+
   protected override updated(changed: PropertyValues): void {
+    this._syncTabStrip(changed);
     // Re-render the QR canvas only on changes that could flip the
     // target URL: panel-open transition, hass change (late-arriving
     // catalogue coords swap the OSM fallback for a `geo:lat,lon`
@@ -378,8 +395,7 @@ export class WienerLinienAustriaCard extends LitElement {
       return;
     }
     const iconName = host.getAttribute("data-qr-icon") ?? "mdi:bus-stop";
-    const iconPath = this._mdiPathFor(iconName);
-    if (!iconPath) return;
+    const iconPath = mdiPathForIcon(iconName);
     // Centred icon footprint: ≈22% of the QR width — stays well inside
     // the H-level error-correction headroom while reading clearly at
     // small sizes.
@@ -418,20 +434,6 @@ export class WienerLinienAustriaCard extends LitElement {
     ctx.restore();
   }
 
-  private _mdiPathFor(iconName: string): string | null {
-    switch (iconName) {
-      case "mdi:subway-variant":
-        return mdiSubwayVariant;
-      case "mdi:tram":
-        return mdiTram;
-      case "mdi:bus":
-        return mdiBus;
-      case "mdi:bus-stop":
-      default:
-        return mdiBusStop;
-    }
-  }
-
   protected override shouldUpdate(changed: PropertyValues): boolean {
     if (!this._config) return false;
     if (
@@ -466,19 +468,12 @@ export class WienerLinienAustriaCard extends LitElement {
   }
 
   private async _checkCardVersion(): Promise<void> {
-    try {
-      this._versionMismatch = await checkCardVersionWS(
-        this.hass,
-        "wiener_linien_austria/card_version",
-        CARD_VERSION,
-      );
-    } catch (err) {
-      // eslint-disable-next-line no-console
-      console.warn(
-        "[wiener-linien-austria-card] version probe failed",
-        err,
-      );
-    }
+    // checkCardVersionWS never rejects, so there is nothing to catch here.
+    this._versionMismatch = await checkCardVersionWS(
+      this.hass,
+      "wiener_linien_austria/card_version",
+      CARD_VERSION,
+    );
   }
 
   // ------------------------------------------------------------------
@@ -508,7 +503,6 @@ export class WienerLinienAustriaCard extends LitElement {
       if (!this._fallbackWarned && (this._config?.entities?.length ?? 0) > 0) {
         this._fallbackWarned = true;
         const requested = this._config?.entities.map((s) => s.entity).join(", ");
-        // eslint-disable-next-line no-console
         console.warn(
           `[wiener-linien-austria-card] configured entity "${requested}" not in hass.states; falling back to "${first}"`,
         );
@@ -539,14 +533,16 @@ export class WienerLinienAustriaCard extends LitElement {
       : stops
           .map((s) => this._attrs(s.entity).attribution)
           .find((v): v is string => typeof v === "string" && v.length > 0) ||
-        "Datenquelle: Wiener Linien (data.wien.gv.at), CC BY 4.0";
+        ATTRIBUTION_FALLBACK;
 
     return html`
       <ha-card>
         ${useTabs ? this._renderTabs(stops, this._activeTab) : nothing}
         <div class="wrap">
           ${renderVersionBanner(this._versionMismatch, (k) => this._t(k))}
-          ${cfg.show_traffic_info ? this._renderTrafficBanner(stops) : nothing}
+          ${cfg.show_traffic_info
+            ? this._renderTrafficBanner(this._bannerStops(stops, useTabs))
+            : nothing}
           ${this._renderBody(stops, useTabs)}
           ${this._renderFooter(attribution)}
         </div>
@@ -565,6 +561,24 @@ export class WienerLinienAustriaCard extends LitElement {
         : nothing}
       ${dev ? this._renderDevModePanel() : nothing}
     `;
+  }
+
+  /** Which stops the alert banner speaks for.
+   *
+   *  The banner sits above the body, outside the tab panel, so in `tabs`
+   *  layout it would otherwise pool the alerts of every configured stop
+   *  and show them under whichever tab is open — a Taubstummengasse
+   *  disruption announced on the Westbahnhof tab. Scope it to the stop
+   *  the reader is actually looking at. In `stacked` layout every stop is
+   *  on screen at once, so the pooled banner is right as it stands.
+   */
+  private _bannerStops(
+    stops: NormalisedModernStop[],
+    useTabs: boolean,
+  ): NormalisedModernStop[] {
+    if (!useTabs || !stops.length) return stops;
+    // Same clamp as _renderBody — willUpdate keeps _activeTab in range.
+    return [stops[this._activeTab] ?? stops[0]!];
   }
 
   private _renderBody(stops: NormalisedModernStop[], useTabs: boolean): TemplateResult {
@@ -587,9 +601,36 @@ export class WienerLinienAustriaCard extends LitElement {
   }
 
   private _renderTabs(stops: NormalisedModernStop[], activeIndex: number): TemplateResult {
+    const edges = this._tabEdges;
+    // The arrows are a pointer shortcut. Keyboard users already move
+    // through the tablist with the arrow keys, Home and End, and selecting
+    // a tab scrolls it into view, so the buttons stay out of the tab order
+    // and away from screen readers rather than adding two stops that
+    // repeat what the tabs do.
+    const arrow = (side: "start" | "end"): TemplateResult => html`<button
+      type="button"
+      class=${classMap({
+        "tab-scroll": true,
+        [`tab-scroll--${side}`]: true,
+        visible: edges[side],
+      })}
+      tabindex="-1"
+      aria-hidden="true"
+      @click=${() => this._scrollTabs(side)}
+    >
+      <ha-icon icon=${side === "start" ? "mdi:chevron-left" : "mdi:chevron-right"}></ha-icon>
+    </button>`;
     return html`
       <div class="tabbar">
-        <div class="tabs" role="tablist">
+        <div
+          class=${classMap({
+            "tabs-viewport": true,
+            "fade-start": edges.start,
+            "fade-end": edges.end,
+          })}
+        >
+        ${arrow("start")}
+        <div class="tabs" role="tablist" @scroll=${this._measureTabs}>
         ${stops.map((s, i) => {
           const attrs = this._attrs(s.entity);
           const label = attrs.stop_name || attrs.friendly_name || s.entity;
@@ -603,11 +644,14 @@ export class WienerLinienAustriaCard extends LitElement {
             class=${classMap(classes)}
             aria-selected=${selected ? "true" : "false"}
             tabindex=${selected ? "0" : "-1"}
+            title=${label}
             @click=${() => this._setActiveTab(i)}
             @keydown=${(ev: KeyboardEvent) =>
               this._onTabKeydown(ev, i, stops.length)}
           >${label}</button>`;
         })}
+        </div>
+        ${arrow("end")}
         </div>
         ${this._renderTabActions(stops, activeIndex)}
       </div>
@@ -639,7 +683,7 @@ export class WienerLinienAustriaCard extends LitElement {
 
     const attrs = this._attrs(active.entity);
     const title = attrs.stop_name || attrs.friendly_name || active.entity;
-    const mapUrl = this._stopMapUrl(title, attrs.latitude, attrs.longitude);
+    const mapUrl = stopMapUrl(title, attrs.latitude, attrs.longitude);
     const geoUri = this._stopGeoUri(title, attrs.latitude, attrs.longitude);
     const qrConfigured = this._config!.show_qr_button !== false;
     const showQrButton = qrConfigured && geoUri !== null;
@@ -678,6 +722,76 @@ export class WienerLinienAustriaCard extends LitElement {
     this._activeTab = clamped;
   }
 
+  /** Keep the tab strip's edge state current and the active tab in view.
+   *
+   *  Runs after every render. The strip element can come and go (a
+   *  config switching layouts, the stop list dropping below two), so the
+   *  observer follows whichever `.tabs` is in the DOM now. Measuring on
+   *  each render as well catches a stop name changing length, which
+   *  changes the content width without resizing the strip itself. */
+  private _syncTabStrip(changed: PropertyValues): void {
+    const tabs = this.renderRoot.querySelector<HTMLElement>(".tabs");
+    const appeared = tabs !== this._observedTabs;
+    if (appeared) {
+      this._tabResize?.disconnect();
+      this._observedTabs = tabs;
+      if (tabs && typeof ResizeObserver !== "undefined") {
+        this._tabResize ??= new ResizeObserver(() => this._measureTabs());
+        this._tabResize.observe(tabs);
+      }
+    }
+    if (!tabs) return;
+    this._measureTabs();
+    if (appeared || changed.has("_activeTab")) {
+      this._revealActiveTab(tabs, !appeared);
+    }
+  }
+
+  private _measureTabs = (): void => {
+    const tabs = this._observedTabs;
+    if (!tabs) return;
+    const next = tabEdges(tabs.scrollLeft, tabs.clientWidth, tabs.scrollWidth);
+    if (next.start !== this._tabEdges.start || next.end !== this._tabEdges.end) {
+      this._tabEdges = next;
+    }
+  };
+
+  /** Scroll the strip just far enough to show the active tab clear of
+   *  the edge fade. Sets `scrollLeft` directly rather than calling
+   *  `scrollIntoView`, which would also scroll the dashboard to bring
+   *  the card on screen: on first render the card may well be below
+   *  the fold, and the page must not jump to it. */
+  private _revealActiveTab(tabs: HTMLElement, smooth: boolean): void {
+    if (getComputedStyle(tabs).direction === "rtl") return;
+    const tab = tabs.querySelectorAll<HTMLElement>('[role="tab"]')[this._activeTab];
+    if (!tab) return;
+    const target = revealOffset(
+      tab.offsetLeft,
+      tab.offsetWidth,
+      tabs.scrollLeft,
+      tabs.clientWidth,
+      tabs.scrollWidth,
+      TAB_FADE_INSET_PX,
+    );
+    if (target === null) return;
+    tabs.scrollTo({ left: target, behavior: smooth ? this._scrollBehavior() : "auto" });
+  }
+
+  private _scrollTabs(side: "start" | "end"): void {
+    const tabs = this._observedTabs;
+    if (!tabs) return;
+    const rtl = getComputedStyle(tabs).direction === "rtl";
+    const toStart = side === "start" !== rtl;
+    const step = arrowStep(tabs.clientWidth);
+    tabs.scrollBy({ left: toStart ? -step : step, behavior: this._scrollBehavior() });
+  }
+
+  private _scrollBehavior(): ScrollBehavior {
+    return window.matchMedia?.("(prefers-reduced-motion: reduce)").matches
+      ? "auto"
+      : "smooth";
+  }
+
   private _onTabKeydown(ev: KeyboardEvent, index: number, count: number): void {
     let next = index;
     switch (ev.key) {
@@ -706,7 +820,6 @@ export class WienerLinienAustriaCard extends LitElement {
         tabs?.[next]?.focus();
       })
       .catch((err) => {
-        // eslint-disable-next-line no-console
         console.warn("[wiener-linien-austria-card] tab focus skipped", err);
       });
   }
@@ -821,7 +934,7 @@ export class WienerLinienAustriaCard extends LitElement {
     const elevatorInfos: ElevatorInfoAttr[] = [...realElevator, ...debugElevator];
     const showElevator = this._config!.show_elevator_info && elevatorInfos.length > 0;
 
-    const mapUrl = this._stopMapUrl(title, attrs.latitude, attrs.longitude);
+    const mapUrl = stopMapUrl(title, attrs.latitude, attrs.longitude);
     // Phone-first QR target: geo: URI hands off to the user's default
     // maps app (Apple Maps, Organic Maps, OsmAnd, …), no Google preference.
     // Stays null when coords are missing — falling back to the OSM web
@@ -847,16 +960,10 @@ export class WienerLinienAustriaCard extends LitElement {
     // unreachable one in the DOM.
     const hasQrToggle = !this._config!.hide_header || tabIndex !== undefined;
 
-    const heroGroup = this._computeHeroGroup(filtered);
-    const heroLead = heroGroup[0];
-
-    // Object-identity dedupe works because heroGroup holds references
-    // into the same `filtered` array.
-    const heroDedupe = this._config!.show_hero_metric
-      ? new Set<DepartureAttr>(heroGroup)
-      : new Set<DepartureAttr>();
-    const remaining = filtered.filter((d) => !heroDedupe.has(d));
-    const rows = remaining.slice(0, this._config!.max_departures);
+    const { heroGroup, heroLead, rows } = splitHeroAndRows(filtered, {
+      showHeroMetric: this._config!.show_hero_metric,
+      maxDepartures: this._config!.max_departures,
+    });
     // Records the coordinator dropped this poll because upstream stopped
     // advancing them. Drives both the "some lines are missing" note above
     // a partially-filled list and the empty-state copy below it.
@@ -1080,7 +1187,7 @@ export class WienerLinienAustriaCard extends LitElement {
     // Resolve the GTFS palette once per banner render — every sensor
     // publishes the same catalogue, so the result is identical across
     // every traffic item. Previously rebuilt per item.
-    const lineColors = firstLineColorsMap(
+    const lineColors = mergeLineColorsMaps(
       this.hass,
       this._config!.entities.map((s) => s.entity),
     );
@@ -1096,7 +1203,7 @@ export class WienerLinienAustriaCard extends LitElement {
    *
    *  Everything here is a plain Lit text binding — upstream text is escaped
    *  by the template, never interpreted as markup. `lang="de"` because the
-   *  ÖDV publishes German only, whatever locale the card is running in;
+   *  OGD feed publishes German only, whatever locale the card runs in;
    *  without it a screen reader in an English UI reads street names with
    *  English phonetics. */
   private _renderTrafficNotice(notice: TrafficNotice): TemplateResult {
@@ -1139,7 +1246,12 @@ export class WienerLinienAustriaCard extends LitElement {
     lineColors: LineColorsMap,
   ): TemplateResult {
     const overrides = this._config!.line_colors;
-    const lines = Array.isArray(t.related_lines) ? t.related_lines : [];
+    // A stop-display notice often names no line; the integration then
+    // supplies the tracked lines calling at its platform, so the badge
+    // still says which service is affected.
+    const related = Array.isArray(t.related_lines) ? t.related_lines : [];
+    const inferred = Array.isArray(t.inferred_lines) ? t.inferred_lines : [];
+    const lines = related.length ? related : inferred;
     const descSource = t.description_html || t.description || "";
     const notice = parseTrafficNotice(descSource);
     const hasNotice = notice.blocks.length > 0 || notice.facts.length > 0;
@@ -1216,38 +1328,6 @@ export class WienerLinienAustriaCard extends LitElement {
     this._expandedTraffic = toggleInSet(this._expandedTraffic, name);
   }
 
-  /**
-   * Compute the hero group: the lead departure plus any others tied
-   * on the exact same countdown. When the lead is at Jetzt (cd <= 0),
-   * group every entry that's also at Jetzt — multiple lines all
-   * arriving simultaneously is precisely the case where surfacing all
-   * of them in the hero is most useful. Outside the Jetzt case, fall
-   * back to strict tie-only grouping so a 5-min lead doesn't pull a
-   * 6-min entry into the hero. Returns [] if there are no usable
-   * departures.
-   */
-  private _computeHeroGroup(filtered: DepartureAttr[]): DepartureAttr[] {
-    if (filtered.length === 0) return [];
-    const cdOf = (d: DepartureAttr): number =>
-      Number.isFinite(d.countdown) ? d.countdown : Number.POSITIVE_INFINITY;
-
-    const minCd = Math.min(...filtered.map(cdOf));
-    if (!Number.isFinite(minCd)) {
-      // Every entry had non-finite countdown — `_resolveStops` already
-      // guaranteed we have one entry, surface it as the single hero.
-      return [filtered[0]!];
-    }
-    if (minCd <= 0) {
-      return filtered.filter((d) => cdOf(d) <= 0);
-    }
-    return filtered.filter((d) => cdOf(d) === minCd);
-  }
-
-  /**
-   * Render one hero-entry row (line badge + direction + optional
-   * platform pill + optional wheelchair pill). Used inside the
-   * hero-meta column; one entry per departure in the hero group.
-   */
   /** Resolve the expand-to-show-stops_ahead state for a departure rendered
    *  either in the hero block or in the row list. Both surfaces share the
    *  same `rowKey`, so opening the panel from one leaves the same panel
@@ -1308,6 +1388,11 @@ export class WienerLinienAustriaCard extends LitElement {
     `;
   }
 
+  /**
+   * Render one hero-entry row (line badge + direction + optional
+   * platform pill + optional wheelchair pill). Used inside the
+   * hero-meta column; one entry per departure in the hero group.
+   */
   private _renderHeroEntry(d: DepartureAttr, entityId: string): TemplateResult {
     const accentLine = d.line || "";
     const accentStyle = chipPalette(
@@ -1315,11 +1400,6 @@ export class WienerLinienAustriaCard extends LitElement {
       this._config!.line_colors,
       lineColorsFor(this.hass, entityId),
     );
-    const platform =
-      this._config!.show_platform && d.platform ? String(d.platform) : null;
-    const isBarrierFree =
-      !!d.barrier_free && this._config!.show_accessibility;
-    const isCooled = !!d.cooling && this._config!.show_cooling;
     const typeIcon = this._config!.show_type_icon ? lineTypeIcon(d.type) : null;
 
     const { hasStopsAhead, rowKey, expanded, panelId, ariaLabel } =
@@ -1360,34 +1440,7 @@ export class WienerLinienAustriaCard extends LitElement {
             ></ha-icon>`
           : nothing}
         <span class="hero-direction">${deText(d.towards)}</span>
-        ${platform
-          ? html`<span class="hero-platform"
-              >${this._t(platformLabelKey(d.type))} ${platform}</span
-            >`
-          : nothing}
-        ${isBarrierFree
-          ? html`<span
-              class="hero-a11y"
-              role="img"
-              aria-label=${this._t("barrier_free_title")}
-              title=${this._t("barrier_free_title")}
-            >
-              <ha-icon
-                icon="mdi:wheelchair-accessibility"
-                aria-hidden="true"
-              ></ha-icon>
-            </span>`
-          : nothing}
-        ${isCooled
-          ? html`<span
-              class="hero-cooling"
-              role="img"
-              aria-label=${this._t("cooling_title")}
-              title=${this._t("cooling_title")}
-            >
-              <ha-icon icon="mdi:snowflake" aria-hidden="true"></ha-icon>
-            </span>`
-          : nothing}
+        ${this._renderHeroBadges(d)}
         ${hasStopsAhead
           ? html`<ha-icon
               class="hero-chevron"
@@ -1396,6 +1449,41 @@ export class WienerLinienAustriaCard extends LitElement {
             ></ha-icon>`
           : nothing}
       </div>
+    `;
+  }
+
+  /** The pills after a hero entry's direction: platform, timetable-only,
+   *  step-free and air-conditioned, each only when it applies and (for the
+   *  last two) the user turned it on. */
+  private _renderHeroBadges(d: DepartureAttr): TemplateResult {
+    const cfg = this._config!;
+    const platform = cfg.show_platform && d.platform ? String(d.platform) : null;
+    const flag = (cls: string, title: string, icon: string): TemplateResult => html`<span
+      class=${cls}
+      role="img"
+      aria-label=${title}
+      title=${title}
+    >
+      <ha-icon icon=${icon} aria-hidden="true"></ha-icon>
+    </span>`;
+    return html`
+      ${platform
+        ? html`<span class="hero-platform"
+            >${this._t(platformLabelKey(d.type))} ${platform}</span
+          >`
+        : nothing}
+      ${d.timetable
+        ? html`<span class="hero-timetable" title=${this._t("timetable_title")}>
+            <ha-icon icon="mdi:calendar-clock" aria-hidden="true"></ha-icon>
+            ${this._t("timetable_only")}
+          </span>`
+        : nothing}
+      ${d.barrier_free && cfg.show_accessibility
+        ? flag("hero-a11y", this._t("barrier_free_title"), "mdi:wheelchair-accessibility")
+        : nothing}
+      ${d.cooling && cfg.show_cooling
+        ? flag("hero-cooling", this._t("cooling_title"), "mdi:snowflake")
+        : nothing}
     `;
   }
 
@@ -1409,7 +1497,8 @@ export class WienerLinienAustriaCard extends LitElement {
       "hero",
     );
     if (!hasStopsAhead) return nothing;
-    return this._renderHeroStopsAheadPanel(
+    return this._renderStopsAheadPanel(
+      "hero",
       d.stops_ahead!,
       panelId,
       expanded,
@@ -1419,7 +1508,19 @@ export class WienerLinienAustriaCard extends LitElement {
     );
   }
 
-  private _renderHeroStopsAheadPanel(
+  /**
+   * The expandable stops-ahead panel, in both places it appears.
+   *
+   * The hero panel is a `<div>` and the row panel a `<li>` (the row list
+   * is a `<ul>`, so the panel has to be a list item to stay valid) — that
+   * is the ONLY difference, and it is why this isn't a single template.
+   * Everything else, including the ARIA wiring, is computed once above
+   * the branch: the two used to be separate methods, which is how an
+   * accessibility or expand-state fix could land on one panel and quietly
+   * miss the other.
+   */
+  private _renderStopsAheadPanel(
+    variant: "hero" | "row",
     stops: NonNullable<DepartureAttr["stops_ahead"]>,
     panelId: string,
     expanded: boolean,
@@ -1427,18 +1528,26 @@ export class WienerLinienAustriaCard extends LitElement {
     rowKey: string,
     entityId: string,
   ): TemplateResult {
-    return html`
-      <div
-        class=${classMap({ "hero-detail": true, expanded })}
-        id=${panelId}
-        role="region"
-        aria-hidden=${expanded ? "false" : "true"}
-      >
-        <div class="hero-detail-inner">
-          ${this._renderStopsAheadInner(stops, currentLine, rowKey, entityId)}
-        </div>
+    const base = variant === "hero" ? "hero-detail" : "dep-row-detail";
+    const cls = classMap({ [base]: true, expanded });
+    const hidden = expanded ? "false" : "true";
+    const body = html`
+      <div class="${base}-inner">
+        ${this._renderStopsAheadInner(stops, currentLine, rowKey, entityId)}
       </div>
     `;
+    return variant === "hero"
+      ? html`<div
+          class=${cls}
+          id=${panelId}
+          role="region"
+          aria-hidden=${hidden}
+        >
+          ${body}
+        </div>`
+      : html`<li class=${cls} id=${panelId} role="region" aria-hidden=${hidden}>
+          ${body}
+        </li>`;
   }
 
   /**
@@ -1451,9 +1560,7 @@ export class WienerLinienAustriaCard extends LitElement {
    * instead of us guessing a polarity.
    */
   private _colorScheme(): "dark" | "light" | undefined {
-    if (this.hass?.themes?.darkMode === true) return "dark";
-    if (this.hass?.themes?.darkMode === false) return "light";
-    return undefined;
+    return colorSchemeOf(this.hass);
   }
 
   /**
@@ -1485,27 +1592,31 @@ export class WienerLinienAustriaCard extends LitElement {
     const lineColors = lineColorsFor(this.hass, entityId);
     const line = d.line || "?";
     const badgeStyle = chipPalette(line, overrides, lineColors);
-    const cd = Number.isFinite(d.countdown) ? d.countdown : null;
-    const cdLabel = cd === null ? "—" : cd <= 0 ? this._t("now") : `${cd} ${this._t("min")}`;
+    // The row's decisions live in utils/row-state.ts (pure, unit-tested);
+    // only the label text is built here, because it needs `_t()`.
+    const {
+      countdown: cd,
+      signedDelay,
+      cdState,
+      hasFlags,
+      platform: rowPlatform,
+    } = deriveRowState(d, {
+      showDelayColors: this._config!.show_delay_colors,
+      showAccessibility: this._config!.show_accessibility,
+      showCooling: this._config!.show_cooling,
+      showPlatform: this._config!.show_platform,
+    });
 
-    // Signed delay (positive = late, negative = early). Computed
-    // independently of show_delay so the state-colour classes still
-    // light up even when the verbose "1 Minute verspätet" text is off.
-    const signedDelay = delayMinutes(d.time_planned, d.time_real);
-    const showDelayText = this._config!.show_delay;
+    const showA11y = this._config!.show_accessibility;
+    const showCooling = this._config!.show_cooling;
+
+    const cdLabel = cd === null ? "—" : cd <= 0 ? this._t("now") : `${cd} ${this._t("min")}`;
     const delayText =
-      showDelayText && signedDelay !== null && signedDelay >= 1
+      this._config!.show_delay && signedDelay !== null && signedDelay >= 1
         ? signedDelay === 1
           ? this._t("delay_singular")
           : this._t("delay_plural", { n: signedDelay })
         : "";
-
-    // Row state — `now` overrides late/early when cd<=0. Empty string
-    // when none apply; the classMap below skips falsy entries.
-    let cdState: "now" | "late" | "early" | "" = "";
-    if (cd !== null && cd <= 0) cdState = "now";
-    else if (signedDelay !== null && signedDelay >= 1) cdState = "late";
-    else if (signedDelay !== null && signedDelay <= -1) cdState = "early";
 
     // Only `now` reads --wl-accent-text inside a row, so only `now` needs
     // the override — late/early carry their own semantic tokens. Same
@@ -1513,16 +1624,6 @@ export class WienerLinienAustriaCard extends LitElement {
     // never disagree about which line this row is.
     const nowColor =
       cdState === "now" ? this._rowAccentText(badgeStyle.background) : null;
-
-    const showA11y = this._config!.show_accessibility;
-    const showCooling = this._config!.show_cooling;
-    const hasFlags = Boolean(
-      d.traffic_jam ||
-        (showA11y && d.barrier_free) ||
-        (showCooling && d.cooling),
-    );
-    const rowPlatform =
-      this._config!.show_platform && d.platform ? String(d.platform) : null;
 
     const typeIcon = this._config!.show_type_icon ? lineTypeIcon(d.type) : null;
 
@@ -1565,6 +1666,11 @@ export class WienerLinienAustriaCard extends LitElement {
           <div class="towards-rows">
             <span class="towards-name">${deText(d.towards)}</span>${delayText
               ? html`<span class="delay">${delayText}</span>`
+              : nothing}${d.timetable
+              ? html`<span class="timetable-note" title=${this._t("timetable_title")}
+                  ><ha-icon icon="mdi:calendar-clock" aria-hidden="true"></ha-icon
+                  >${this._t("timetable_only")}</span
+                >`
               : nothing}
           </div>
         </div>
@@ -1626,30 +1732,16 @@ export class WienerLinienAustriaCard extends LitElement {
 
     return [
       rowTpl,
-      this._renderStopsAheadPanel(d.stops_ahead!, panelId, expanded, line, rowKey, entityId),
+      this._renderStopsAheadPanel(
+        "row",
+        d.stops_ahead!,
+        panelId,
+        expanded,
+        line,
+        rowKey,
+        entityId,
+      ),
     ];
-  }
-
-  private _renderStopsAheadPanel(
-    stops: NonNullable<DepartureAttr["stops_ahead"]>,
-    panelId: string,
-    expanded: boolean,
-    currentLine: string,
-    rowKey: string,
-    entityId: string,
-  ): TemplateResult {
-    return html`
-      <li
-        class=${classMap({ "dep-row-detail": true, expanded })}
-        id=${panelId}
-        role="region"
-        aria-hidden=${expanded ? "false" : "true"}
-      >
-        <div class="dep-row-detail-inner">
-          ${this._renderStopsAheadInner(stops, currentLine, rowKey, entityId)}
-        </div>
-      </li>
-    `;
   }
 
   private _renderStopAhead(
@@ -1659,19 +1751,17 @@ export class WienerLinienAustriaCard extends LitElement {
     overrides: Record<string, string>,
     lineColors: LineColorsMap,
   ): TemplateResult {
-    // Inline lines (always shown next to the station name): U-Bahn at
-    // any time, plus night lines (N-prefix + digit) WHEN they're
-    // actually running. Outside the night window the N-chips fold
-    // back into the +N toggle so the daytime trail stays compact.
-    // Wiener Linien NightLine runs daily ~00:30–05:00 with first/last
-    // buses spreading from ~23:55 to ~05:15 across all routes — we
-    // use that envelope as the active window.
+    // Inline lines (always shown next to the station name): U-Bahn and
+    // S-Bahn at any time, plus night lines (N-prefix + digit) WHEN
+    // they're actually running. Outside the night window the N-chips
+    // fold back into the +N toggle so the daytime trail stays compact.
+    // Night window per `_isNightlineHour`.
     const allLines = s.lines ?? [];
     const nightActive = this._isNightlineHour();
     const inlineLines: string[] = [];
     const otherLines: string[] = [];
     for (const l of allLines) {
-      if (/^U\d/.test(l) || (nightActive && /^N\d/.test(l))) {
+      if (/^[US]\d/.test(l) || (nightActive && /^N\d/.test(l))) {
         inlineLines.push(l);
       } else {
         otherLines.push(l);
@@ -1808,7 +1898,7 @@ export class WienerLinienAustriaCard extends LitElement {
     return result;
   }
 
-  // Single source of truth for the cross-render row identity. `rowStableId`
+  // Single source of truth for the cross-render row identity. The stable id
   // uses `time_planned` so panels stay open across polls (countdown ticks
   // every minute and would re-key the row, snapping the panel closed).
   // The hero, hero-companion and row-list paths all key by exactly this
@@ -1818,10 +1908,10 @@ export class WienerLinienAustriaCard extends LitElement {
     return `${entityId}|${d.line}|${d.direction}|${d.towards ?? ""}|${stableId}`;
   }
 
-  // Per-surface DOM id for the stops-ahead panel. Distinct prefix between
-  // Stable id keyed on time_planned (countdown mutates every minute and
-  // would break aria-controls mid-tick). hero / row variants get
-  // different prefixes so an in-page anchor can target either surface.
+  // Per-surface DOM id for the stops-ahead panel. Keyed on time_planned
+  // (countdown mutates every minute and would break aria-controls
+  // mid-tick). hero / row variants get different prefixes so an in-page
+  // anchor can target either surface.
   private _panelId(d: DepartureAttr, entityId: string, prefix: "hero" | "row"): string {
     const safeEid = safeDomId(entityId);
     const suffix = prefix === "hero" ? "wl-hero-stopsahead" : "wl-stopsahead";
@@ -1841,35 +1931,6 @@ export class WienerLinienAustriaCard extends LitElement {
    *  through this so the `|`-delimited grammar lives in one place. */
   private _transferKey(rowKey: string, stopIndex: number): string {
     return `${rowKey}|${stopIndex}`;
-  }
-
-  /**
-   * Official Vienna city map (beta viewer) — stadtplan.wien.gv.at,
-   * maintained by Magistrat der Stadt Wien. Built on basemap.at
-   * tiles, renders the Wiener-Linien stop network natively, and
-   * exposes a hash-based permalink with a stable WGS84 contract:
-   *
-   *   #/@<lon>,<lat>,<zoom>,<rotation>,<tilt>,<basemap>/<theme>
-   *
-   * Used by the header map button and the dialog "open in maps" link.
-   * Falls back to OpenStreetMap search when the sensor doesn't expose
-   * coordinates (rare — the integration normally seeds them from the
-   * Wiener Linien static catalogue at config-flow time).
-   */
-  private _stopMapUrl(
-    stopName: string | undefined,
-    lat: number | null | undefined,
-    lon: number | null | undefined,
-  ): string | null {
-    let url: string | null = null;
-    if (typeof lat === "number" && typeof lon === "number") {
-      // 17.5 is street-level zoom — close enough that the stop and its
-      // platforms read clearly without losing the surrounding block.
-      url = `https://stadtplan.wien.gv.at/#/@${lon},${lat},17.5,0,0,standard/themes`;
-    } else if (stopName) {
-      url = `https://www.openstreetmap.org/search?query=${encodeURIComponent(`${stopName}, Wien`)}`;
-    }
-    return url ? safeHttpsUri(url) || null : null;
   }
 
   /**
@@ -2040,7 +2101,7 @@ export class WienerLinienAustriaCard extends LitElement {
       live: false,
     }));
     const seen = new Set(entries.map((e) => e.hex.toUpperCase()));
-    const live = firstLineColorsMap(
+    const live = mergeLineColorsMaps(
       this.hass,
       (this._config?.entities ?? []).map((s) => s.entity),
     );

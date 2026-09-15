@@ -1,0 +1,26 @@
+plan_trip:
+  fields:
+    config_entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: wiener_linien_austria
+    origin:
+      required: false
+      example: Stephansplatz
+      selector:
+        text:
+    destination:
+      required: false
+      example: Westbahnhof
+      selector:
+        text:
+    datetime:
+      required: false
+      selector:
+        datetime:
+    arrive_by:
+      required: false
+      default: false
+      selector:
+        boolean:

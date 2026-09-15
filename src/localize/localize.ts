@@ -28,11 +28,8 @@ function resolveString(path: string, dictionary: Dict): string | undefined {
   return typeof v === "string" ? v : undefined;
 }
 
-// Use `?:` AND `T | undefined` together so callers can either omit the
-// key or pass `undefined` explicitly — `exactOptionalPropertyTypes`
-// rejects `undefined` values for `?:` fields whose type doesn't include
-// `undefined`, and most callers in this codebase pass an explicit
-// `hass?.language` (which is `string | undefined`).
+// Dual form (see utils/config.ts): most callers pass an explicit
+// `hass?.language`, which is `string | undefined`.
 export interface TranslateContext {
   configLanguage?: string | undefined;
   hassLanguage?: string | undefined;
@@ -65,4 +62,23 @@ export function translate(
     }
   }
   return s;
+}
+
+/**
+ * A card-picker string. Cards register into `window.customCards` when the
+ * bundle loads, before any card has a `hass`, so the language comes from the
+ * page instead: HA sets `<html lang>` to the user's language, and keeps the
+ * picked one in localStorage as `selectedLanguage` (a JSON string).
+ */
+export function pickerText(key: string): string {
+  let stored: string | undefined;
+  try {
+    const raw = window.localStorage?.getItem("selectedLanguage");
+    stored = raw ? (JSON.parse(raw) as string) : undefined;
+  } catch {
+    stored = undefined;
+  }
+  const hassLanguage =
+    document.documentElement.lang || stored || navigator.language || undefined;
+  return translate(`common.picker.${key}`, { hassLanguage });
 }

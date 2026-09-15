@@ -1,13 +1,13 @@
 // Local mirror of the HA / Lovelace types this card actually uses.
 // Replaces the `custom-card-helpers` dependency — the package is
 // effectively unmaintained and bundled HA-internal types drift faster
-// than its release cadence. `fireEvent` is duplicated as a 6-line shim
-// inside the editor modules (see `editor.ts` and `retro-editor.ts`),
-// keeping the types layer free of any value-side helper.
+// than its release cadence. Value-side helpers stay out of this layer:
+// `fireEvent` has one implementation, in utils.ts, which all four
+// editors import.
 
 /** Single entity in `hass.states`. The attributes bag is open-ended —
  *  the integration's coordinator emits the keys these cards read
- *  (`departures`, `traffic_info`, `attribution`, `lift_info`, …). */
+ *  (`departures`, `traffic_info`, `elevator_info`, `attribution`, …). */
 export interface HassEntity {
   state: string;
   attributes: Record<string, unknown>;
@@ -68,6 +68,7 @@ declare global {
     "wiener-linien-austria-retro-card-editor": LovelaceCardEditor;
     "hui-error-card": LovelaceCard;
     "ha-form": HaFormElement;
+    "ha-icon-picker": HaIconPickerElement;
   }
 }
 
@@ -84,7 +85,7 @@ export interface CustomCardEntry extends Record<string, unknown> {
   ) => Record<string, unknown> | Array<Record<string, unknown>> | null;
 }
 
-/** Window shape for the HA `customCards` registry. All three card
+/** Window shape for the HA `customCards` registry. All four card
  *  entrypoints push their picker descriptor into `window.customCards` at
  *  module load — this interface is the canonical cast target so the
  *  registration blocks read identically and a future maintainer can't
@@ -159,6 +160,17 @@ export type HASelector =
 export interface HaFormBaseSchema {
   name: string;
   required?: boolean;
+  /** Render the field greyed out and non-interactive. Present on HA core's own
+   *  `HaFormBaseSchema` and long supported; mirrored here because the v2
+   *  editors use it for dependent options.
+   *
+   *  We disable rather than hide, and put the reason in `computeHelper`. HA
+   *  2026.8 added a declarative `visible:` condition which would be the
+   *  cleaner tool, but it drops a hidden field's value and needs a frontend
+   *  floor this repo does not have (`hacs.json` declares HA 2025.1.0). On an
+   *  older frontend an unknown `visible` key is ignored and the field renders
+   *  unconditionally — so it is not safe to ship here yet. */
+  disabled?: boolean;
 }
 
 export interface HaFormSelectorSchema extends HaFormBaseSchema {
@@ -187,6 +199,14 @@ export type HaFormSchema =
   | HaFormSelectorSchema
   | HaFormGridSchema
   | HaFormExpandableSchema;
+
+/** `<ha-icon-picker>` element shape. Only usable outside `ha-form` — see
+ *  editor/header-strip.ts for why nesting it in an expandable breaks it. */
+interface HaIconPickerElement extends HTMLElement {
+  value?: string;
+  label?: string;
+  disabled?: boolean;
+}
 
 // `<ha-form>` element shape — mirror the props the editor sets so
 // `tsc --noEmit` validates the template at compile time.
@@ -241,6 +261,10 @@ export interface DepartureAttr {
   // Optional per-departure list of upcoming stops on this trip. Absent
   // (or empty) means "no panel" — the row renders without a chevron.
   stops_ahead?: StopAheadAttr[];
+  /** A planned S-Bahn row from the timetable, not a live `/monitor` row.
+   *  Absent on live rows. Its countdown runs off the planned time, so the
+   *  cards mark it rather than let it pass for live. */
+  timetable?: boolean;
 }
 
 export interface TrafficInfoAttr {
@@ -251,11 +275,21 @@ export interface TrafficInfoAttr {
   location?: string;
   related_lines?: string[];
   related_stops?: number[];
+  // Tracked lines calling at the matched platform, set only on a
+  // "stoerungkurz" notice that names no lines itself. The badge fallback
+  // for `related_lines`, which stays exactly what upstream published.
+  inferred_lines?: string[];
   time_start?: string;
   time_end?: string;
   time_created?: string;
   time_last_update?: string;
   status?: string;
+  // Which upstream feed this came from: "stoerunglang" (line-scoped
+  // control-centre disruption) or "stoerungkurz" (the platform's own
+  // display text, already filtered to this card's stops on the Python
+  // side). Both render in the same banner; the field is here so a
+  // consumer can tell them apart.
+  category?: string;
 }
 
 export interface ElevatorInfoAttr {
@@ -341,7 +375,6 @@ export interface WienerLinienCardConfig extends LovelaceCardConfig {
   entities?: Array<ModernStopConfig | string> | undefined;
   // v0.1.x back-compat: single-entity legacy shape is promoted to entities[0]
   // inside normaliseConfig. Both shapes read here; only `entities` survives.
-  // `?: T | undefined` dual form for exactOptionalPropertyTypes compatibility.
   entity?: string | undefined;
   lines?: string[] | undefined;
   direction?: "H" | "R" | "" | undefined;
@@ -357,6 +390,8 @@ export interface WienerLinienCardConfig extends LovelaceCardConfig {
   show_traffic_info?: boolean | undefined;
   show_elevator_info?: boolean | undefined;
   show_delay?: boolean | undefined;
+  /** Colour the countdown red when late / green when early. */
+  show_delay_colors?: boolean | undefined;
   show_type_icon?: boolean | undefined;
   show_platform?: boolean | undefined;
   show_hero_metric?: boolean | undefined;
@@ -451,8 +486,8 @@ export interface RetroHeaderSide {
 
 export interface WienerLinienRetroCardConfig extends LovelaceCardConfig {
   type: string;
-  // `?: T | undefined` — dual form for `exactOptionalPropertyTypes`
-  // compatibility (callers may set or omit each field).
+  // `?: T | undefined` throughout — see the optionality convention in
+  // utils/config.ts.
   entity?: string | undefined;
   direction?: "H" | "R" | undefined;
   line?: string | undefined;
@@ -483,11 +518,16 @@ export interface WienerLinienRetroCardConfig extends LovelaceCardConfig {
   show_header?: boolean | undefined;
   header_left?: RetroHeaderSide | undefined;
   header_right?: RetroHeaderSide | undefined;
+  /** Superseded by `show_line_pill` in v2.0.0 — same meaning, new name; see
+   *  utils/card-vocabulary.ts for why the name had to be given up. Still read
+   *  by `normaliseRetroConfig` so existing YAML keeps working.
+   *  @deprecated Use `show_line_pill`. */
+  line_pill?: boolean | undefined;
   /** Tweak — render the line code as a filled rounded pill in the
    *  line's resolved colour (GTFS routes.txt → nightline rule →
    *  amber fallback) with a soft outer glow. Off by default; the LED
    *  panel's canonical voice is monochrome amber. */
-  line_pill?: boolean | undefined;
+  show_line_pill?: boolean | undefined;
   /** Tweak — paint a 4 px vertical bar at each row's left edge in the
    *  line's resolved colour with a faint matching glow. Off by default
    *  so pre-feature retro cards stay byte-identical. */
@@ -566,8 +606,11 @@ export interface WienerLinienFlapCardConfig extends LovelaceCardConfig {
    *  first row's platform changes" problem the old side-toggle was
    *  there to work around. */
   show_platform?: boolean | undefined;
-  /** Show the WL-orange station-name band. Mirrors the retro card's
-   *  field of the same name. Default `true`. */
+  /** Show the WL-orange station-name band. Shares its name and meaning
+   *  with the retro card's field, but NOT its default: flap defaults
+   *  `true` (the band is part of the Solari board's identity), retro
+   *  defaults `false` (the LED panel shipped without one). Deliberate —
+   *  see `CARD_DEFAULTS` in utils/card-vocabulary.ts. */
   show_station_name?: boolean | undefined;
   /** Background colour for the station-name band. Defaults to the
    *  first tracked line's GTFS colour (sentinel `"line"`); user can
@@ -600,17 +643,172 @@ export interface WienerLinienFlapCardConfig extends LovelaceCardConfig {
    *  and complies with the Wiener Linien OGD licence requirement
    *  unless the user explicitly opts out. */
   hide_attribution?: boolean | undefined;
-  /** Tweak — hide the line column entirely. Useful for single-line
-   *  setups where the line is implicit (e.g. a card scoped to one
-   *  metro line via per-stop `lines` filter). Default `false`. The
-   *  name mirrors the retro card's `line_pill` toggle by convention,
-   *  even though the flap-card effect is different (column hide vs
-   *  pill render); both are presentation tweaks on the line slot. */
+  /** Superseded by `show_line_column` in v2.0.0, which inverts the polarity
+   *  so the editor label can read positively; see utils/card-vocabulary.ts.
+   *  Still read by `normaliseFlapConfig` so existing YAML keeps working.
+   *  @deprecated Use `show_line_column` (inverted). */
   line_pill?: boolean | undefined;
+  /** Show the line column. Default `true`. Turn it off for single-line setups
+   *  where the line is implicit (e.g. a card scoped to one metro line via the
+   *  per-stop `lines` filter). */
+  show_line_column?: boolean | undefined;
   /** Tweak — wrap the board in the cream-cabinet housing (bevel +
    *  drop shadow). Default `true` (preserves the original flap-card
    *  look). When `false`, the board sits flush against the dashboard
-   *  with no surround — matches the retro card's `housing` semantics
-   *  (off = flush, on = bezel). */
+   *  with no surround. Shares the retro card's `housing` semantics
+   *  (off = flush, on = bezel) but NOT its default: retro defaults
+   *  `false`, because the LED panel shipped flush and existing cards
+   *  must stay that way. Deliberate — see `CARD_DEFAULTS` in
+   *  utils/card-vocabulary.ts. */
   housing?: boolean | undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Route card (experimental) — A→B connections from a route entry.
+// Shapes mirror `routing.py`'s `to_dict()` output, published on
+// `sensor.<route>_next_connection`.
+// ---------------------------------------------------------------------------
+
+export type RouteRisk = "ok" | "tight" | "at_risk";
+
+export interface RouteStopAttr {
+  name: string;
+  stop_id: string | null;
+  platform: string | null;
+  planned: string | null;
+  estimated: string | null;
+  delay_minutes: number | null;
+  /** From the stop catalogue by DIVA; absent for stops it doesn't hold. */
+  latitude?: number;
+  longitude?: number;
+}
+
+export interface RouteLegAttr {
+  walk: boolean;
+  line: string | null;
+  type: string | null;
+  product: string | null;
+  towards: string | null;
+  origin: RouteStopAttr;
+  destination: RouteStopAttr;
+  realtime: boolean;
+  stop_count: number;
+  duration_minutes: number | null;
+  walk_after_minutes: number;
+  cancelled: boolean;
+  /** `H` / `R`, as on the departure boards. */
+  direction?: string | null;
+  /** Live (or planned) departures after this one, from `/monitor`. */
+  next_departures?: string[];
+  /** Typical minutes between departures here, from `/monitor`. */
+  headway_minutes?: number | null;
+  /** Planned with a low-floor vehicle. */
+  low_floor?: boolean;
+  /** Lifts and stairs on this leg's own walk. */
+  access?: RouteAccessStepAttr[];
+  /** The stops between boarding and alighting. */
+  stops?: RouteLegStopAttr[];
+}
+
+export interface RouteLegStopAttr {
+  name: string;
+  stop_id: string | null;
+  time: string | null;
+  latitude?: number;
+  longitude?: number;
+}
+
+/** A lift, stairs or ramp on the way to, from or between platforms. */
+export interface RouteAccessStepAttr {
+  kind: string;
+  level: string | null;
+  stop_id: string | null;
+}
+
+export interface RouteTransferAttr {
+  at: string;
+  walk_minutes: number;
+  slack_minutes: number;
+  risk: RouteRisk;
+  /** Lifts and stairs on the way from one vehicle to the next. */
+  access?: RouteAccessStepAttr[];
+}
+
+export interface RouteTripAttr {
+  departure: string | null;
+  arrival: string | null;
+  duration_minutes: number | null;
+  interchanges: number;
+  risk: RouteRisk;
+  cancelled: boolean;
+  legs: RouteLegAttr[];
+  transfers: RouteTransferAttr[];
+}
+
+export interface RouteActiveWindow {
+  from: string | null;
+  to: string | null;
+  days: string[] | null;
+}
+
+export interface RouteAttrs {
+  origin?: string;
+  destination?: string;
+  active?: boolean;
+  active_window?: RouteActiveWindow;
+  fetched_at?: string | null;
+  min_transfer_minutes?: number;
+  trips?: RouteTripAttr[];
+  line_colors?: LineColorsMap;
+  traffic_info?: Array<{ title?: string; description?: string; related_lines?: string[] }>;
+  /** Lift outages at stations whose lifts the trips use; `stop_ids` names them. */
+  elevator_info?: Array<{ station?: string; description?: string; stop_ids?: string[] }>;
+  /** Planned step-free. */
+  step_free?: boolean;
+  /** Route entities, late evening: the night's last connection without a
+   *  bus, or null. */
+  last_connection?: RouteTripAttr | null;
+  attribution?: string;
+  /** Ad-hoc only: an older plan served because the request budget is spent. */
+  stale?: boolean;
+  /** Ad-hoc only, with `stale`: seconds until a fresh plan can be had. */
+  retry_after?: number | null;
+  /** Ad-hoc only: the chosen time the plan is for; null for "now". */
+  planned_for?: string | null;
+  /** Ad-hoc only, with `planned_for`: arriving by that time, not leaving. */
+  arrive_by?: boolean;
+  [key: string]: unknown;
+}
+
+/** One picker option from `wiener_linien_austria/stops`. */
+export interface AdhocStopOption {
+  value: string;
+  label: string;
+}
+
+/** Rejection shape of `hass.callWS` for a command that answered an error. */
+export interface HassWsError {
+  code?: string;
+  message?: string;
+  translation_key?: string;
+  translation_placeholders?: Record<string, string>;
+}
+
+export interface WienerLinienRouteCardConfig extends LovelaceCardConfig {
+  type: string;
+  /** A configured route sensor. Unset switches the card to ad-hoc mode:
+   *  From / To pickers, planned on demand. */
+  entity?: string | undefined;
+  /** Ad-hoc mode: stop DIVA preselected as origin / destination. */
+  from?: string | number | undefined;
+  to?: string | number | undefined;
+  /** Overrides the "Origin → Destination" heading. */
+  title?: string | undefined;
+  /** How many further connections the disclosure lists. 0 hides it. */
+  alternatives?: number | undefined;
+  hide_attribution?: boolean | undefined;
+  /** Ad-hoc mode: plan step-free connections. */
+  step_free?: boolean | undefined;
+  /** The map pin after each boarding stop and the destination. Default true. */
+  show_map_pins?: boolean | undefined;
 }

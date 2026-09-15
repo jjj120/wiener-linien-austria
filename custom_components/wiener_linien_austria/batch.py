@@ -16,14 +16,22 @@ drain the domain cooldown otherwise imposed (see rate_limit.py).
 The upstream API omits unknown/decommissioned ``stopId``s from an otherwise
 ``messageCode: 1`` response rather than erroring (verified empirically), so a
 single stale RBL never fails the batch — the affected member simply parses
-zero departures for that stop, exactly as a per-entry fetch would today.
+zero departures for that stop.
+
+There is no cap on how many ``stopId`` params one request may carry: measured
+2026-09-07, 200 real RBLs returned ``messageCode: 1`` with 168 stops populated,
+the last requested id present and the absentees scattered rather than truncated
+at a prefix. The only ceiling is URL length, enforced by the edge before the
+application sees it — a 4,799-character query still answered ``200``, 7,199
+answered ``403`` and 8,319 answered ``414 Request-URI Too Large``. At roughly
+12 characters per four-digit ``stopId=NNNN&`` that is ~400 stops in one
+request, which no realistic install approaches, so we do not chunk.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import random
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
@@ -36,15 +44,18 @@ from homeassistant.helpers.update_coordinator import UpdateFailed
 
 from .const import (
     API_BASE_URL,
-    BACKOFF_CAP_SECONDS,
+    BATCH_REGISTRY_KEY,
     DOMAIN,
     ERR_RATE_LIMIT,
     MONITOR_ENDPOINT,
+    RATE_LIMIT_TRANSLATION_KEY,
     UPSTREAM_ERROR_KEYS,
     USER_AGENT,
 )
-from .http import CacheValidators, base_request_headers
-from .rate_limit import async_enforce_domain_cooldown
+from .http import base_request_headers
+from .live import async_get_live_board
+from .parsing import as_int
+from .rate_limit import async_enforce_domain_cooldown, backoff_delay
 
 if TYPE_CHECKING:
     from .coordinator import WienerLinienAustriaCoordinator
@@ -57,13 +68,11 @@ class BatchResult:
     """Outcome of one combined /monitor fetch, shared by all group members.
 
     ``body`` is the validated raw JSON (``messageCode == 1``); members parse
-    their own slice from it. ``not_modified`` is True on a 304 revalidation —
-    the body is the previously-cached one and members should keep their data.
+    their own slice from it.
     """
 
     body: dict[str, Any]
     server_time: str | None
-    not_modified: bool = False
 
 
 class MonitorBatchGroup:
@@ -77,13 +86,6 @@ class MonitorBatchGroup:
         self._current_interval = self._normal_interval
         self._members: dict[str, WienerLinienAustriaCoordinator] = {}
         self._session = async_get_clientsession(hass)
-        # Conditional-GET validators for the combined request. Reset whenever
-        # the member RBL set changes so a stale ETag can't yield a misleading
-        # 304 against a different query (the server would 200 anyway, but
-        # resetting keeps the intent explicit).
-        self._cache = CacheValidators()
-        self._cached_rbls: tuple[int, ...] = ()
-        self._last_body: dict[str, Any] | None = None
         # Single-flight: serialise the group's own fetches so a manual
         # refresh and a timer tick can't both fire the request at once.
         self._fetch_lock = asyncio.Lock()
@@ -95,28 +97,48 @@ class MonitorBatchGroup:
     # ------------------------------------------------------------------
 
     def add_member(self, coordinator: WienerLinienAustriaCoordinator) -> None:
-        """Register a coordinator into this group and invalidate the RBL cache."""
+        """Register a coordinator into this group."""
         self._members[coordinator.entry_id] = coordinator
-        self._invalidate_rbl_cache()
 
     def remove_member(self, entry_id: str) -> bool:
         """Deregister a coordinator; return True if the group is now empty."""
         self._members.pop(entry_id, None)
-        self._invalidate_rbl_cache()
         return not self._members
 
-    def _invalidate_rbl_cache(self) -> None:
-        """Drop conditional-GET validators when the union RBL set may change."""
-        self._cache = CacheValidators()
-        self._cached_rbls = ()
-        self._last_body = None
+    @property
+    def has_members(self) -> bool:
+        """Whether this group is polling for anyone."""
+        return bool(self._members)
+
+    @property
+    def interval_seconds(self) -> int:
+        """The configured cadence this group was created for."""
+        return self._interval_seconds
 
     def union_rbls(self) -> list[int]:
-        """Deduplicated, sorted union of every member's RBLs."""
+        """Deduplicated, sorted union of every member's RBLs.
+
+        The fastest group also carries the stops that routes and on-demand
+        plans need live times for (live.py), so those ride in a request made
+        anyway instead of one of their own. Members only parse their own
+        RBLs, so the extra monitors in the answer don't reach their boards.
+        """
         seen: set[int] = set()
         for coordinator in self._members.values():
             seen.update(coordinator.rbls)
+        if seen and self._is_fastest():
+            seen.update(async_get_live_board(self.hass).leased_rbls())
         return sorted(seen)
+
+    def _is_fastest(self) -> bool:
+        registry = self.hass.data.get(DOMAIN, {}).get(BATCH_REGISTRY_KEY)
+        if not isinstance(registry, dict):
+            return True
+        running = [group for group in registry.values() if group.has_members]
+        if not running:
+            return True
+        fastest = min(running, key=lambda group: group.interval_seconds)
+        return fastest is self
 
     # ------------------------------------------------------------------
     # Timer lifecycle
@@ -148,7 +170,18 @@ class MonitorBatchGroup:
             )
 
     async def _async_timer_tick(self, _now: Any) -> None:
-        """Fetch once for the whole group and fan the result out to members."""
+        """Fetch once for the whole group and fan the result out to members.
+
+        Every step is guarded, for the same reason `__init__.py` guards its two
+        periodic callbacks: an exception escaping an
+        `async_track_time_interval` callback is logged by HA core under its
+        generic listener namespace rather than this integration's, and it skips
+        the backoff bookkeeping below — so an unguarded raise would leave the
+        group hammering the API at full cadence while looking silent.
+
+        The fan-out loops are guarded per member, not around the loop, so one
+        member whose slice fails to parse cannot starve the members after it.
+        """
         # Snapshot members up front — the fetch awaits, and a concurrent
         # unload could mutate the dict mid-iteration otherwise.
         members = list(self._members.values())
@@ -157,16 +190,54 @@ class MonitorBatchGroup:
         try:
             result = await self.async_fetch()
         except UpdateFailed as err:
+            self._note_failure(
+                rate_limited=err.translation_key == RATE_LIMIT_TRANSLATION_KEY
+            )
+            self._fan_out_error(members, err)
+            return
+        except Exception as err:  # noqa: BLE001 — periodic callback safety net
+            # `async_fetch` raises `UpdateFailed` for everything it anticipates;
+            # anything else (a Repairs-registry write, a member side effect)
+            # still has to count as a failure so backoff engages.
+            _LOGGER.warning("Combined monitor fetch failed: %s", err)
             self._note_failure()
-            for coordinator in members:
-                coordinator.batch_set_error(err)
+            self._fan_out_error(members, _unexpected_failure(err))
             return
         self._note_success()
-        if result.not_modified:
-            # Nothing changed upstream — members keep their prior data.
-            return
         for coordinator in members:
-            coordinator.batch_apply(result)
+            try:
+                coordinator.batch_apply(result)
+            except Exception as err:  # noqa: BLE001 — one member must not starve the rest
+                _LOGGER.warning(
+                    "Applying the combined /monitor response failed for entry %s: %s",
+                    coordinator.entry_id,
+                    err,
+                )
+                self._set_member_error(coordinator, _unexpected_failure(err))
+
+    def _fan_out_error(
+        self,
+        members: list[WienerLinienAustriaCoordinator],
+        err: UpdateFailed,
+    ) -> None:
+        """Mark every member's update as failed, one member at a time."""
+        for coordinator in members:
+            self._set_member_error(coordinator, err)
+
+    def _set_member_error(
+        self,
+        coordinator: WienerLinienAustriaCoordinator,
+        err: UpdateFailed,
+    ) -> None:
+        """Push a failure onto one member, swallowing a listener-side raise."""
+        try:
+            coordinator.batch_set_error(err)
+        except Exception as exc:  # noqa: BLE001 — periodic callback safety net
+            _LOGGER.warning(
+                "Recording the batch failure for entry %s failed: %s",
+                coordinator.entry_id,
+                exc,
+            )
 
     # ------------------------------------------------------------------
     # Fetch
@@ -187,18 +258,10 @@ class MonitorBatchGroup:
         await async_enforce_domain_cooldown(self.hass)
 
         rbls = self.union_rbls()
-        rbl_tuple = tuple(rbls)
-        if rbl_tuple != self._cached_rbls:
-            # Membership changed since the last fetch — the cached validators
-            # belong to a different query. Drop them.
-            self._cache = CacheValidators()
-            self._cached_rbls = rbl_tuple
-            self._last_body = None
 
         url = f"{API_BASE_URL}{MONITOR_ENDPOINT}"
         params: list[tuple[str, str]] = [("stopId", str(rbl)) for rbl in rbls]
         headers = base_request_headers(USER_AGENT)
-        headers.update(self._cache.to_request_headers())
         timeout = aiohttp.ClientTimeout(total=30)
 
         try:
@@ -206,27 +269,6 @@ class MonitorBatchGroup:
                 url, params=params, headers=headers, timeout=timeout
             ) as resp:
                 status = resp.status
-                if status == 304:
-                    if self._last_body is not None:
-                        self._cache.update_from_response(resp)
-                        return BatchResult(
-                            body=self._last_body,
-                            server_time=self._last_body.get("message", {}).get(
-                                "serverTime"
-                            ),
-                            not_modified=True,
-                        )
-                    # 304 with no cached body to revalidate — treat as a
-                    # transient (practically unreachable: validators reset on
-                    # init and on membership change).
-                    raise UpdateFailed(
-                        translation_domain=DOMAIN,
-                        translation_key="api_invalid_response",
-                        translation_placeholders={
-                            "status": "304",
-                            "error": "no cached data to revalidate",
-                        },
-                    )
                 resp.raise_for_status()
 
                 try:
@@ -252,7 +294,7 @@ class MonitorBatchGroup:
                     )
 
                 message = body.get("message") or {}
-                code = _safe_int(message.get("messageCode"))
+                code = as_int(message.get("messageCode"))
                 server_time = message.get("serverTime")
                 # Propagate the latest server-time / error-code to every member
                 # before any raise, so diagnostics reflect the last observed
@@ -265,7 +307,7 @@ class MonitorBatchGroup:
                         coordinator.note_rate_limited()
                     raise UpdateFailed(
                         translation_domain=DOMAIN,
-                        translation_key="api_rate_limited",
+                        translation_key=RATE_LIMIT_TRANSLATION_KEY,
                     )
 
                 if code is not None and code != 1:
@@ -286,11 +328,6 @@ class MonitorBatchGroup:
 
                 for coordinator in self._members.values():
                     coordinator.note_not_rate_limited()
-                # Capture validators only on a fully-validated 200 — never for
-                # an error reply, else the next tick would send If-None-Match
-                # against a payload we never accepted.
-                self._cache.update_from_response(resp)
-                self._last_body = body
         except TimeoutError as err:
             raise UpdateFailed(
                 translation_domain=DOMAIN,
@@ -316,6 +353,10 @@ class MonitorBatchGroup:
                 },
             ) from err
 
+        try:
+            async_get_live_board(self.hass).ingest(body, rbls)
+        except Exception as err:  # noqa: BLE001 — live times must never fail a board
+            _LOGGER.warning("Recording live times for routes failed: %s", err)
         return BatchResult(body=body, server_time=server_time)
 
     # ------------------------------------------------------------------
@@ -329,31 +370,46 @@ class MonitorBatchGroup:
         self._consecutive_failures = 0
         self._reschedule(self._normal_interval)
 
-    def _note_failure(self) -> None:
+    def _note_failure(self, *, rate_limited: bool = False) -> None:
         """Bump the failure counter and widen the cadence with jittered backoff.
 
         First failure holds the configured cadence (transient hiccups
         shouldn't slow the loop). From the second onward the interval doubles,
         capped at ``BACKOFF_CAP_SECONDS``. Jitter (+/-10%) avoids a
         thundering-herd retry when the API recovers. Reset on the next success.
+
+        ``rate_limited`` is the one exception. Error 316 is not a hiccup to
+        ride out — it is upstream saying in as many words that we are polling
+        too fast, so holding cadence for one more interval just to confirm it
+        spends another request proving what the API already told us. Widen on
+        the first one instead.
         """
         self._consecutive_failures += 1
-        if self._consecutive_failures < 2:
+        if self._consecutive_failures < 2 and not rate_limited:
             return
-        normal_secs = self._normal_interval.total_seconds()
-        backoff_secs = min(
-            normal_secs * (2 ** (self._consecutive_failures - 1)),
-            BACKOFF_CAP_SECONDS,
+        # A 316 on the very first failure has nothing to double yet; count
+        # it as the second so it still halves the request rate rather than
+        # rescheduling to the cadence it already has.
+        self._reschedule(
+            backoff_delay(
+                self._normal_interval,
+                max(self._consecutive_failures, 2),
+                jitter=True,
+            )
         )
-        jittered = backoff_secs * random.uniform(0.9, 1.1)
-        self._reschedule(timedelta(seconds=jittered))
 
 
-def _safe_int(value: Any) -> int | None:
-    """Best-effort integer coercion; returns None on failure."""
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
+def _unexpected_failure(err: Exception) -> UpdateFailed:
+    """Wrap an unanticipated exception as a translated ``UpdateFailed``.
+
+    The guarded callback paths still have to hand members a failure that
+    carries `translation_domain` / `translation_key`, never a bare string.
+    """
+    return UpdateFailed(
+        translation_domain=DOMAIN,
+        translation_key="api_invalid_response",
+        translation_placeholders={
+            "status": "0",
+            "error": f"{type(err).__name__}: {err}",
+        },
+    )

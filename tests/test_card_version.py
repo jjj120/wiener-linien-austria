@@ -10,8 +10,8 @@ If these drift, HA's frontend WebSocket check sees a mismatch, shows a
 reload banner, the reload re-serves the same mismatched JS, and the
 banner reappears — infinite loop for every user on an old card.
 
-Wiener Linien ships *three* card variants (modern + retro + flap), each
-with its own constant. The test asserts all three separately so a
+Wiener Linien ships *four* card variants (modern + retro + flap + route),
+each with its own constant. The test asserts all four separately so a
 failure points at exactly which constant drifted.
 """
 
@@ -26,6 +26,7 @@ from custom_components.wiener_linien_austria.const import (
     FLAP_CARD_VERSION,
     INTEGRATION_VERSION,
     RETRO_CARD_VERSION,
+    ROUTE_CARD_VERSION,
 )
 
 _TS_CONST = Path(__file__).parent.parent / "src" / "const.ts"
@@ -38,6 +39,7 @@ _MANIFEST = (
 _CARD_PATTERN = re.compile(r'\bCARD_VERSION\s*=\s*"([^"]+)"')
 _RETRO_PATTERN = re.compile(r'\bRETRO_CARD_VERSION\s*=\s*"([^"]+)"')
 _FLAP_PATTERN = re.compile(r'\bFLAP_CARD_VERSION\s*=\s*"([^"]+)"')
+_ROUTE_PATTERN = re.compile(r'\bROUTE_CARD_VERSION\s*=\s*"([^"]+)"')
 
 
 def _read_ts_source() -> str:
@@ -54,7 +56,7 @@ def _expected_version() -> str:
 def test_integration_version_matches_manifest() -> None:
     """`INTEGRATION_VERSION` must equal `manifest.json::version` byte-for-byte."""
     expected = _expected_version()
-    assert INTEGRATION_VERSION == expected, (
+    assert expected == INTEGRATION_VERSION, (
         f"INTEGRATION_VERSION drift: const.py={INTEGRATION_VERSION!r} vs "
         f"manifest.json={expected!r} — const.py should derive from manifest"
     )
@@ -135,7 +137,7 @@ def test_flap_card_version_matches_ts() -> None:
     )
 
 
-# LINE_TYPE_* parity. The four MeansOfTransport strings live in two places
+# LINE_TYPE_* parity. The five MeansOfTransport strings live in two places
 # (Python const.py + TS src/utils/mot.ts) because they're stable upstream
 # URL constants — duplicating them is cheaper than publishing them as a
 # sensor attribute on every state write. The test here locks that the two
@@ -145,6 +147,7 @@ _LINE_TYPE_PATTERNS: dict[str, re.Pattern[str]] = {
     "LINE_TYPE_METRO": re.compile(r'\bLINE_TYPE_METRO\s*=\s*"([^"]+)"'),
     "LINE_TYPE_TRAM": re.compile(r'\bLINE_TYPE_TRAM\s*=\s*"([^"]+)"'),
     "LINE_TYPE_BUS_DAY": re.compile(r'\bLINE_TYPE_BUS_DAY\s*=\s*"([^"]+)"'),
+    "LINE_TYPE_S_BAHN": re.compile(r'\bLINE_TYPE_S_BAHN\s*=\s*"([^"]+)"'),
     "LINE_TYPE_BUS_NIGHT": re.compile(r'\bLINE_TYPE_BUS_NIGHT\s*=\s*"([^"]+)"'),
 }
 
@@ -166,3 +169,40 @@ def test_line_type_constants_match_python_and_ts() -> None:
             f"{name} drift: const.py={py_value!r} vs "
             f"src/utils/mot.ts={ts_value!r} — bump both together"
         )
+
+
+# LEGACY_LINE_LABELS parity. The alias map lives in two places (Python
+# const.py + TS src/utils/line-labels.ts) for the same reason LINE_TYPE_*
+# does: a handful of stable upstream strings, cheaper duplicated than
+# published on every state write. The card copy exists to rescue configs
+# saved with the old spelling, so a drifted copy silently empties a board.
+_LINE_LABELS_TS = Path(__file__).parent.parent / "src" / "utils" / "line-labels.ts"
+_LEGACY_LABEL_ENTRY_RE = re.compile(r'"?([\w]+)"?\s*:\s*"([^"]+)"\s*,')
+
+
+def test_legacy_line_labels_match_python_and_ts() -> None:
+    """The legacy→realtime label map must be identical on both sides."""
+    from custom_components.wiener_linien_austria.const import LEGACY_LINE_LABELS
+
+    assert _LINE_LABELS_TS.is_file(), f"expected TS module at {_LINE_LABELS_TS}"
+    ts_source = _LINE_LABELS_TS.read_text(encoding="utf-8")
+    body = ts_source.split("LEGACY_LINE_LABELS", 1)[1].split("{", 1)[1].split("}", 1)[0]
+    ts_map = dict(_LEGACY_LABEL_ENTRY_RE.findall(body))
+    assert ts_map == LEGACY_LINE_LABELS, (
+        f"alias-map drift: const.py={LEGACY_LINE_LABELS} vs "
+        f"src/utils/line-labels.ts={ts_map} — update both together"
+    )
+
+
+def test_route_card_version_aliases_integration_version() -> None:
+    """`ROUTE_CARD_VERSION` is in lockstep with `INTEGRATION_VERSION`."""
+    assert ROUTE_CARD_VERSION == INTEGRATION_VERSION
+
+
+def test_route_card_version_matches_ts() -> None:
+    """`src/const.ts:ROUTE_CARD_VERSION` must equal the manifest version."""
+    match = _ROUTE_PATTERN.search(_read_ts_source())
+    assert match is not None, (
+        f"ROUTE_CARD_VERSION literal not found in {_TS_CONST}; regex may be stale"
+    )
+    assert match.group(1) == _expected_version()

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from dataclasses import dataclass
+import math
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
-import aiohttp
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_SCAN_INTERVAL
 from homeassistant.core import HomeAssistant
@@ -23,18 +25,25 @@ from .const import (
     CONF_RBLS,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
+    LINE_TYPE_S_BAHN,
+    MAX_POLL_SECONDS,
+    MAX_STOPS_AHEAD,
+    MIN_POLL_SECONDS,
     STALE_DEPARTURE_MAX_AGE,
 )
-
-# Eager import — `stops_ahead_for_match` runs in the /monitor parser's
-# hot loop, so the other names from `static` are already in sys.modules
-# anyway. No import-time saving from lazy imports here.
+from .parsing import as_int
+from .s_bahn_network import current_lines_at_diva as current_s_bahn_lines
+from .s_bahn_network import merge_transfer_lines
 from .static import (
-    CATALOGUE_KEY,
+    CATALOGUE_LOAD_ERRORS,
     StaticCatalogue,
     async_get_catalogue,
+    canonical_line_key,
+    current_catalogue,
+    is_s_bahn_label,
     stops_ahead_for_match,
 )
+from .timetable import PlannedDeparture, TimetableBoard
 
 if TYPE_CHECKING:
     from .batch import BatchResult, MonitorBatchGroup
@@ -44,13 +53,10 @@ _LOGGER = logging.getLogger(__name__)
 
 # Public type alias — threaded through every signature that reads
 # `entry.runtime_data` (Platinum `runtime-data` + `strict-typing` rules).
-# Signatures that only use the entry for construction (coordinator
-# `__init__`) or for IDs/title (sensor `__init__`, options-flow
-# staticmethod) keep plain `ConfigEntry`. Hoisted to the top of the
-# module so external readers see the public-API shape before the
-# implementation; PEP 695 `type` evaluates the RHS lazily, so the
-# forward reference to `WienerLinienAustriaCoordinator` resolves at
-# use-time, not definition-time.
+# Signatures that only use the entry for construction or for IDs/title
+# keep plain `ConfigEntry`. Declared here rather than below the class
+# because PEP 695 `type` evaluates its RHS lazily, so the forward
+# reference resolves at use-time.
 type WienerLinienConfigEntry = ConfigEntry[WienerLinienAustriaCoordinator]
 
 
@@ -61,7 +67,7 @@ class Departure:
     line: str
     towards: str
     direction: str  # "H" | "R"
-    type: str  # ptMetro | ptTram | ptBusCity | ptBusNight | …
+    type: str  # ptMetro | ptTram | ptBusCity | ptBusNight | ptTrainS | …
     countdown: int
     time_planned: str | None
     time_real: str | None
@@ -81,6 +87,10 @@ class Departure:
     # matches the row (replacement service, short-turn variant, etc.). The
     # card treats None and missing-key as identical: render no chevron.
     stops_ahead: list[dict[str, Any]] | None = None
+    # A planned S-Bahn row from the timetable (timetable.py), not a live
+    # `/monitor` row. The cards mark these so a planned time isn't read as
+    # a live one.
+    timetable: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Render as a plain dict for HA attributes / diagnostics."""
@@ -100,6 +110,8 @@ class Departure:
         }
         if self.stops_ahead is not None:
             out["stops_ahead"] = self.stops_ahead
+        if self.timetable:
+            out["timetable"] = True
         return out
 
 
@@ -130,7 +142,7 @@ class WienerLinienAustriaCoordinator(DataUpdateCoordinator[MonitorData]):
         # generic KeyError / ValueError from __init__.
         raw_rbls = config.get(CONF_RBLS) or []
         self._rbls: list[int] = [
-            rbl for rbl in (_safe_int(x) for x in raw_rbls) if rbl is not None
+            rbl for rbl in (as_int(x) for x in raw_rbls) if rbl is not None
         ]
         if not self._rbls:
             raise ConfigEntryError(
@@ -139,6 +151,13 @@ class WienerLinienAustriaCoordinator(DataUpdateCoordinator[MonitorData]):
                 translation_placeholders={"received": repr(raw_rbls)},
             )
         self._selected_lines: set[str] | None = _normalise_lines(config.get(CONF_LINES))
+        # The S-Bahn lines picked for this stop, as (line, direction). Empty
+        # for most stops, which then never ask the timetable for anything.
+        self._timetable_pairs: frozenset[tuple[str, str]] = frozenset(
+            (parts[0], parts[1])
+            for key in self._selected_lines or ()
+            if len(parts := key.split("|", 2)) >= 2 and is_s_bahn_label(parts[0])
+        )
         self._rate_limited: bool = False
         self._last_error_code: int | None = None
         self._server_time: str | None = None
@@ -148,12 +167,16 @@ class WienerLinienAustriaCoordinator(DataUpdateCoordinator[MonitorData]):
         # hass.data (alerts, line colours, catalogue) and re-parses
         # CONF_LINES every time; caching collapses that to once per
         # coordinator tick OR alerts refresh. Invalidated by:
-        #   • `_async_update_data` setting cache=None at the top, and
-        #   • sensor.py noticing `ALERTS_SEQ_KEY` advanced past
+        #   • `_invalidate_attrs_cache`, called before every data or error
+        #     push (`_async_update_data`, `batch_apply`, `batch_set_error`
+        #     and the timetable refresh), and
+        #   • `cached_attrs` seeing `ALERTS_SEQ_KEY` advance past
         #     `_attrs_cache_alerts_seq`.
+        # Read and written through `cached_attrs` / `store_attrs` — see
+        # those for why the pair is not two plain public attributes.
         self._attrs_cache: dict[str, Any] | None = None
         self._attrs_cache_alerts_seq: int | None = None
-        diva_int = _safe_int(config.get(CONF_DIVA))
+        diva_int = as_int(config.get(CONF_DIVA))
         if diva_int is None:
             raise ConfigEntryError(
                 translation_domain=DOMAIN,
@@ -161,6 +184,12 @@ class WienerLinienAustriaCoordinator(DataUpdateCoordinator[MonitorData]):
                 translation_placeholders={"received": repr(config.get(CONF_DIVA))},
             )
         self._diva: int = diva_int
+        self._timetable: TimetableBoard | None = (
+            TimetableBoard(hass, diva_int) if self._timetable_pairs else None
+        )
+        # The last `/monitor` slice before the timetable rows were merged in,
+        # so a timetable refresh landing between ticks can re-merge.
+        self._last_monitor: MonitorData | None = None
         self._latitude: float | None = None
         self._longitude: float | None = None
         # De-dupe stops_ahead matcher exceptions per line label so a
@@ -169,11 +198,16 @@ class WienerLinienAustriaCoordinator(DataUpdateCoordinator[MonitorData]):
         self._stops_ahead_warned_lines: set[str] = set()
         # Latch for the stale-feed warning; see _note_stale_departures.
         self._stale_warned: bool = False
-        scan_secs = _safe_int(config.get(CONF_SCAN_INTERVAL)) or DEFAULT_SCAN_INTERVAL
+        # Clamped here as well as in the forms: an entry edited by hand in
+        # `.storage` never passes the selector, and the batch group polls at
+        # whatever this says.
+        scan_secs = as_int(config.get(CONF_SCAN_INTERVAL)) or DEFAULT_SCAN_INTERVAL
+        scan_secs = min(max(scan_secs, MIN_POLL_SECONDS), MAX_POLL_SECONDS)
         self._scan_interval = timedelta(seconds=scan_secs)
         # The shared batch group that owns this entry's fetching. Assigned by
         # `attach_batch` during entry setup, before the first refresh.
         self._batch: MonitorBatchGroup | None = None
+        self._timetable_task: asyncio.Task[None] | None = None
 
         super().__init__(
             hass,
@@ -213,14 +247,7 @@ class WienerLinienAustriaCoordinator(DataUpdateCoordinator[MonitorData]):
         """
         try:
             catalogue = await async_get_catalogue(self.hass)
-        except (
-            TimeoutError,
-            aiohttp.ClientError,
-            KeyError,
-            TypeError,
-            ValueError,
-            RuntimeError,
-        ) as err:
+        except CATALOGUE_LOAD_ERRORS as err:
             _LOGGER.debug("Could not load static catalogue for coords: %s", err)
             return
         station = catalogue.stations_by_diva.get(self._diva)
@@ -243,6 +270,17 @@ class WienerLinienAustriaCoordinator(DataUpdateCoordinator[MonitorData]):
         return self._server_time
 
     @property
+    def server_time_parsed(self) -> datetime | None:
+        """Return `server_time` as an aware datetime, or None if unusable.
+
+        Exists so `binary_sensor.py` can age the payload without importing
+        `_parse_iso` across a module boundary. Always aware — see
+        `_parse_iso` for why a naive upstream value gets HA's configured
+        zone rather than UTC.
+        """
+        return _parse_iso(self._server_time)
+
+    @property
     def rbls(self) -> list[int]:
         return list(self._rbls)
 
@@ -255,6 +293,11 @@ class WienerLinienAustriaCoordinator(DataUpdateCoordinator[MonitorData]):
     def scan_interval(self) -> timedelta:
         """User-configured polling cadence; the batch group is keyed on this."""
         return self._scan_interval
+
+    @property
+    def timetable(self) -> TimetableBoard | None:
+        """This stop's S-Bahn timetable, or None when no S-Bahn line is picked."""
+        return self._timetable
 
     @property
     def latitude(self) -> float | None:
@@ -359,7 +402,7 @@ class WienerLinienAustriaCoordinator(DataUpdateCoordinator[MonitorData]):
         Reads the live catalogue ref so a background trip-pattern refresh that
         lands after setup is picked up on the next parse — no restart needed.
         """
-        catalogue = self._current_catalogue()
+        catalogue = current_catalogue(self.hass)
         data = _parse_monitor_body(
             result.body,
             self._selected_lines,
@@ -367,9 +410,60 @@ class WienerLinienAustriaCoordinator(DataUpdateCoordinator[MonitorData]):
             catalogue=catalogue,
             entry_rbls=self._rbls,
             warned_lines=self._stops_ahead_warned_lines,
+            s_bahn_lines_at_diva=current_s_bahn_lines(self.hass),
         )
         self._note_stale_departures(data)
-        return data
+        self._last_monitor = data
+        self._schedule_timetable_refresh()
+        return self._with_timetable(data)
+
+    def _with_timetable(self, data: MonitorData) -> MonitorData:
+        """Merge the picked S-Bahn lines' planned departures into a slice."""
+        if self._timetable is None:
+            return data
+        planned = timetable_departures(
+            self._timetable.departures,
+            self._timetable_pairs,
+            dt_util.utcnow(),
+            catalogue=current_catalogue(self.hass),
+            s_bahn_lines_at_diva=current_s_bahn_lines(self.hass),
+        )
+        if not planned:
+            return data
+        merged = [*data.departures, *planned]
+        merged.sort(key=_departure_sort_key)
+        return replace(data, departures=merged)
+
+    def _schedule_timetable_refresh(self) -> None:
+        """Start a timetable refresh in the background when one is due.
+
+        Background, because `batch_apply` is synchronous and a slow routing
+        server must not hold up the live rows. The refresh pushes its own
+        update when it lands.
+        """
+        board = self._timetable
+        if board is None or not board.is_due(dt_util.utcnow()):
+            return
+        if self._timetable_task is not None and not self._timetable_task.done():
+            return
+        self._timetable_task = self._entry.async_create_background_task(
+            self.hass,
+            self._async_refresh_timetable(board),
+            name=f"{DOMAIN} timetable {self._diva}",
+        )
+
+    async def _async_refresh_timetable(self, board: TimetableBoard) -> None:
+        """Refetch the timetable and re-publish the last slice with it."""
+        if not await board.async_refresh() or self._last_monitor is None:
+            return
+        # A `/monitor` failure may have landed while the refresh was waiting
+        # (it queues behind the routing cooldown). Republishing the last good
+        # slice now would mark the coordinator successful and hide the
+        # outage; the next good tick merges the new timetable anyway.
+        if not self.last_update_success:
+            return
+        self._invalidate_attrs_cache()
+        self.async_set_updated_data(self._with_timetable(self._last_monitor))
 
     def _note_stale_departures(self, data: MonitorData) -> None:
         """Log an upstream freeze once per episode, not once per poll.
@@ -400,37 +494,87 @@ class WienerLinienAustriaCoordinator(DataUpdateCoordinator[MonitorData]):
             data.server_time,
         )
 
+    def cached_attrs(self, alerts_seq: int) -> dict[str, Any] | None:
+        """Return the memoised attrs payload, or None if it needs rebuilding.
+
+        The cache is valid only while BOTH halves of its key still hold:
+        the coordinator hasn't ticked (which nulls the payload) and the
+        domain-wide alerts sequence hasn't advanced. Handing callers the
+        pair as two public attributes invited each of them to
+        re-implement that conjunction; this method is the only place it
+        is written down.
+
+        Returns the SAME dict object, not a copy. `extra_state_attributes`
+        is a 10 Hz read path on a busy dashboard and the payload is ~27 KB
+        at a hub stop, so a defensive copy here would cost more than the
+        memoisation saves. The contract is therefore that callers treat
+        the result as read-only; the one writer goes through
+        `store_attrs`.
+        """
+        if self._attrs_cache is not None and self._attrs_cache_alerts_seq == alerts_seq:
+            return self._attrs_cache
+        return None
+
+    def store_attrs(self, attrs: dict[str, Any], alerts_seq: int) -> None:
+        """Memoise a freshly built attrs payload against the alerts sequence."""
+        self._attrs_cache = attrs
+        self._attrs_cache_alerts_seq = alerts_seq
+
     def _invalidate_attrs_cache(self) -> None:
         """Drop the memoised extra_state_attributes payload before a state change."""
         self._attrs_cache = None
         self._attrs_cache_alerts_seq = None
-
-    def _current_catalogue(self) -> StaticCatalogue | None:
-        """Fetch the live catalogue ref from hass.data, or None.
-
-        The catalogue may be a `StaticCatalogue` (resolved), an
-        `asyncio.Task` (still loading on a fresh start), or absent
-        (load hasn't been triggered yet). Only the resolved form is
-        useful for enrichment; the others fall through to None and
-        the parser skips stops_ahead.
-        """
-        domain_data = self.hass.data.get(DOMAIN, {})
-        cached = domain_data.get(CATALOGUE_KEY)
-        if isinstance(cached, StaticCatalogue):
-            return cached
-        return None
 
 
 def _normalise_lines(raw: Any) -> set[str] | None:
     """Coerce CONF_LINES into a set of selected line keys.
 
     An entry missing/empty CONF_LINES means "track every line at this stop".
+
+    Keys are mapped through `canonical_line_key`, so a selection saved
+    before the catalogue learned the realtime spelling ("LB|H") compares
+    against the label the feed actually sends ("WLB|H"). Matching the same
+    way the sensor and the reconfigure form already read these keys keeps
+    one vocabulary across the entry (issue #110).
     """
     if raw is None:
         return None
     if not isinstance(raw, list):
         return None
-    return {str(x) for x in raw} or None
+    return {canonical_line_key(str(x)) for x in raw} or None
+
+
+def _row_is_selected(
+    selected_pairs: set[tuple[str, str]],
+    line_name: str,
+    direction: str,
+    line_id: int | None,
+    catalogue: StaticCatalogue | None,
+) -> bool:
+    """Does this live monitor row fall inside the user's line selection?
+
+    A row matches on either:
+
+      * its own `line.name` from the feed, or
+      * the catalogue's label for its `line.lineId`.
+
+    `_normalise_lines` has already folded the saved keys onto the realtime
+    spelling for the divergences we know about, so the first arm carries
+    the normal case. The second is for the ones we don't: a label the feed
+    and the catalogue disagree on that is *not* in `REALTIME_LINE_LABELS`
+    (the night Rufbus lines, which no daytime probe can observe), and the
+    window after an upgrade where the cached catalogue still holds the
+    pre-alias labels. Both are joins on an identifier both sides publish
+    rather than a guess about spelling.
+    """
+    if (line_name, direction) in selected_pairs:
+        return True
+    if line_id is None or catalogue is None or catalogue.trip_patterns is None:
+        return False
+    catalogue_label = catalogue.trip_patterns.label_for_line.get(line_id)
+    if catalogue_label is None or catalogue_label == line_name:
+        return False
+    return (catalogue_label, direction) in selected_pairs
 
 
 def _parse_monitor_body(
@@ -441,6 +585,7 @@ def _parse_monitor_body(
     catalogue: StaticCatalogue | None = None,
     entry_rbls: list[int] | None = None,
     warned_lines: set[str] | None = None,
+    s_bahn_lines_at_diva: Mapping[int, Sequence[str]] | None = None,
 ) -> MonitorData:
     """Parse a successful /monitor response into a MonitorData.
 
@@ -452,6 +597,8 @@ def _parse_monitor_body(
     `warned_lines`, when supplied, is a per-coordinator de-dupe set so
     a stops_ahead matcher exception logs once at WARNING per line label
     rather than spamming on every poll.
+
+    `s_bahn_lines_at_diva` adds the S-Bahn to the trails' transfer lines.
     """
     departures: list[Departure] = []
     stale_dropped = 0
@@ -461,12 +608,18 @@ def _parse_monitor_body(
     # what the records are consistent with, so a skewed HA clock can't
     # start hiding real departures. Falls back to our clock only when the
     # response carried no usable serverTime.
+    #
+    # No naive/aware guard on the comparisons below: `_parse_iso` stamps a
+    # zone on anything the feed sends without one, and `dt_util.utcnow()` is
+    # aware, so both sides of `planned_at < stale_cutoff` are aware by
+    # construction. That invariant lives in `_parse_iso` — keep it there
+    # rather than re-guarding every comparison site.
     reference_time = _parse_iso(server_time) or dt_util.utcnow()
     stale_cutoff = reference_time - STALE_DEPARTURE_MAX_AGE
     monitors = (body.get("data") or {}).get("monitors") or []
-    # Narrow `catalogue` once for the loop below — mypy carries the
-    # narrowing across the closure boundary if we hand it through a
-    # local alias that's either the catalogue or None.
+    # Narrow `catalogue` once for the loop below: enrichment needs both
+    # "not None" and "has a trip-pattern index", and folding the pair into
+    # one alias keeps that test out of the per-row hot path.
     pattern_catalogue: StaticCatalogue | None = (
         catalogue
         if catalogue is not None and catalogue.trip_patterns is not None
@@ -479,8 +632,7 @@ def _parse_monitor_body(
     # match would intermittently drop the whole line block. Each departure
     # keeps its own `vehicle.towards` so the actual destination is preserved.
     # Malformed keys (no pipe) are dropped silently — they could never
-    # match `(line_name, direction)` anyway. The walrus binds the split
-    # once per key so the comp can both length-check and index it.
+    # match `(line_name, direction)` anyway.
     selected_pairs: set[tuple[str, str]] | None = (
         None
         if selected is None
@@ -495,13 +647,12 @@ def _parse_monitor_body(
     # `locationStop.properties.attributes.rbl`. Applied only when `entry_rbls`
     # is given AND the monitor actually carries an rbl: a monitor with no rbl
     # (older payloads, hand-built test fixtures) falls through to
-    # include-all, matching the pre-batch single-request behaviour where the
-    # request already scoped the response.
+    # include-all.
     rbl_filter: set[int] | None = set(entry_rbls) if entry_rbls else None
 
     for monitor in monitors:
         if rbl_filter is not None:
-            monitor_rbl = _safe_int(
+            monitor_rbl = as_int(
                 (monitor.get("locationStop") or {})
                 .get("properties", {})
                 .get("attributes", {})
@@ -513,6 +664,12 @@ def _parse_monitor_body(
             line_name = str(line.get("name") or "").strip()
             if not line_name:
                 continue
+            # `line.lineId` is the same identifier `linien.csv` publishes
+            # as `LineID`, so it joins a live row to the catalogue without
+            # going through the label — which the two sources do not
+            # always spell the same way (issue #110: the Badner Bahn is
+            # "WLB" live and "LB" in the CSV).
+            line_id = as_int(line.get("lineId"))
             line_towards = str(line.get("towards") or "").strip()
             direction = str(line.get("direction") or "").strip()
             line_type = str(line.get("type") or "").strip()
@@ -521,15 +678,18 @@ def _parse_monitor_body(
             traffic_jam = bool(line.get("trafficjam"))
             platform = str(line.get("platform") or "").strip() or None
 
-            if (
-                selected_pairs is not None
-                and (line_name, direction) not in selected_pairs
+            if selected_pairs is not None and not _row_is_selected(
+                selected_pairs,
+                line_name,
+                direction,
+                line_id,
+                pattern_catalogue,
             ):
                 continue
 
             for entry in (line.get("departures") or {}).get("departure") or []:
                 dep_time = entry.get("departureTime") or {}
-                countdown = _safe_int(dep_time.get("countdown"))
+                countdown = as_int(dep_time.get("countdown"))
                 if countdown is None:
                     continue
                 # Drop records the upstream feed has stopped advancing.
@@ -556,6 +716,8 @@ def _parse_monitor_body(
                             entry_rbls,
                             resolved_towards,
                             live_direction=direction,
+                            line_id=line_id,
+                            s_bahn_lines_at_diva=s_bahn_lines_at_diva,
                         )
                     except Exception:
                         # Fail-soft: a single matcher hiccup must not poison
@@ -603,7 +765,7 @@ def _parse_monitor_body(
                     )
                 )
 
-    departures.sort(key=lambda d: (d.countdown, d.line, d.towards))
+    departures.sort(key=_departure_sort_key)
     return MonitorData(
         departures=departures,
         server_time=server_time,
@@ -612,27 +774,152 @@ def _parse_monitor_body(
     )
 
 
+def timetable_departures(
+    planned: tuple[PlannedDeparture, ...],
+    pairs: frozenset[tuple[str, str]],
+    now: datetime,
+    *,
+    catalogue: StaticCatalogue | None = None,
+    s_bahn_lines_at_diva: Mapping[int, Sequence[str]] | None = None,
+) -> list[Departure]:
+    """Board rows for the picked S-Bahn lines that haven't left yet.
+
+    A train drops off the moment its planned time has passed: there is no
+    live time to say it's still at the platform. The countdown is whole
+    minutes rounded down, as `/monitor` counts, so a train due within the
+    minute reads 0.
+
+    `barrier_free` stays False because the timetable doesn't say. The
+    cards only render the positive case, so that shows nothing rather
+    than a false "not step-free".
+
+    `stops_ahead` comes from the timetable's own stop sequence rather than
+    the Wiener Linien trip patterns, which don't know the S-Bahn. Same
+    shape as `/monitor` rows get; `catalogue` adds the Wiener Linien lines
+    at each stop as transfers, and `s_bahn_lines_at_diva` the other S-Bahn
+    lines.
+    """
+    rows: list[Departure] = []
+    for dep in planned:
+        if (dep.line, dep.direction) not in pairs:
+            continue
+        seconds = (dep.planned - now).total_seconds()
+        if seconds < 0:
+            continue
+        rows.append(
+            Departure(
+                line=dep.line,
+                towards=dep.towards,
+                direction=dep.direction,
+                type=LINE_TYPE_S_BAHN,
+                countdown=math.floor(seconds / 60),
+                time_planned=dep.planned.isoformat(),
+                time_real=None,
+                realtime=False,
+                barrier_free=False,
+                traffic_jam=False,
+                platform=dep.platform,
+                stops_ahead=_timetable_stops_ahead(
+                    dep, catalogue, s_bahn_lines_at_diva
+                ),
+                timetable=True,
+            )
+        )
+    return rows
+
+
+def _timetable_stops_ahead(
+    dep: PlannedDeparture,
+    catalogue: StaticCatalogue | None,
+    s_bahn_lines_at_diva: Mapping[int, Sequence[str]] | None = None,
+) -> list[dict[str, Any]] | None:
+    """A planned train's onward stops as a `stops_ahead` list.
+
+    None without a stop sequence, so the row shows no chevron. Capped at
+    `MAX_STOPS_AHEAD` like the `/monitor` trail. The last stop is flagged
+    as the terminus only when it is the train's destination: a capped list
+    isn't, and neither is a sequence the server ends early (seen
+    2026-09-15: an S2 towards Wolfsthal listing only Hauptbahnhof, where
+    the run continues under another number). Transfer lines are the Wiener
+    Linien lines at the stop's DIVA plus the other S-Bahn lines there, the
+    train's own line left out.
+    """
+    if not dep.stops:
+        return None
+    lines_at_diva = (
+        catalogue.trip_patterns.lines_at_diva
+        if catalogue is not None and catalogue.trip_patterns is not None
+        else {}
+    )
+    out: list[dict[str, Any]] = []
+    last = len(dep.stops) - 1
+    for index, stop in enumerate(dep.stops[:MAX_STOPS_AHEAD]):
+        entry: dict[str, Any] = {"name": stop.name}
+        if index == last and _same_stop_name(stop.name, dep.towards):
+            entry["is_terminus"] = True
+        if stop.stop_id is not None:
+            lines = merge_transfer_lines(
+                lines_at_diva.get(stop.stop_id, ()),
+                (s_bahn_lines_at_diva or {}).get(stop.stop_id, ()),
+                exclude=dep.line,
+            )
+            if lines:
+                entry["lines"] = lines
+        out.append(entry)
+    return out
+
+
+def _same_stop_name(stop_name: str, towards: str) -> bool:
+    """Whether a stop is the terminus a train is signed for.
+
+    The stop sequence can qualify a name the direction doesn't: an S1
+    towards "Hauptbahnhof" lists its last stop as "Hauptbahnhof
+    (S-Bahn-Station)" (seen 2026-09-15), so a trailing bracket is ignored.
+    """
+    base, bracket, _ = stop_name.partition(" (")
+    return stop_name == towards or (bool(bracket) and base == towards)
+
+
+def _departure_sort_key(dep: Departure) -> tuple[int, str, str]:
+    return (dep.countdown, dep.line, dep.towards)
+
+
 def _parse_iso(value: Any) -> datetime | None:
-    """Best-effort ISO-8601 parse of an upstream timestamp.
+    """Best-effort ISO-8601 parse of an upstream timestamp, always tz-aware.
 
     The /monitor feed emits `2026-08-27T06:55:30.000+0200`, which
     `datetime.fromisoformat` handles natively on every Python this
     integration supports. Returns None on anything else so callers can
     fail open rather than act on a timestamp they couldn't read.
+
+    A parsed value with no UTC offset is stamped with HA's configured
+    time zone, NOT with UTC. Both matter:
+
+    * Returning it naive is what makes `planned_at < stale_cutoff` in
+      `_parse_monitor_body` a `TypeError`, because the cutoff is derived
+      from `dt_util.utcnow()` whenever `serverTime` itself is missing or
+      unparseable — so one naive field is enough to reach it, not two.
+      On the batch timer path that raise is caught per member; on
+      `async_config_entry_first_refresh` it becomes a
+      `ConfigEntryNotReady` that retries forever.
+    * Forcing UTC instead would silently shift a naive Vienna timestamp
+      by one or two hours. Against a `STALE_DEPARTURE_MAX_AGE` cutoff a
+      shift that size starts dropping real departures, which is a worse
+      failure than the crash it fixes. Every sample the feed has ever
+      sent carries `+0100`/`+0200`, so the only sane reading of a naive
+      value is local wall-clock.
+
+    `dt_util.get_default_time_zone()` is HA's configured zone rather
+    than a hardcoded Europe/Vienna: an install whose clock is set
+    somewhere else is already interpreting every other naive timestamp
+    that way, and disagreeing with the rest of HA would be its own bug.
     """
     if not isinstance(value, str):
         return None
     try:
-        return datetime.fromisoformat(value)
+        parsed = datetime.fromisoformat(value)
     except ValueError:
         return None
-
-
-def _safe_int(value: Any) -> int | None:
-    """Best-effort integer coercion; returns None on failure."""
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=dt_util.get_default_time_zone())
+    return parsed

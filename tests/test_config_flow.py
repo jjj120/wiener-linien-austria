@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
@@ -11,12 +12,9 @@ from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 
 from custom_components.wiener_linien_austria.config_flow import (
-    _format_distance,
-    _nearest_stations,
     _probe_monitor_lines,
     _resolve_lines_for_picker,
     _static_lines_for_station,
-    _stop_options,
 )
 from custom_components.wiener_linien_austria.const import (
     CONF_DIVA,
@@ -31,9 +29,25 @@ from custom_components.wiener_linien_austria.static import (
     TripPattern,
     TripPatternIndex,
 )
+from custom_components.wiener_linien_austria.stops import (
+    format_distance,
+    nearest_stations,
+    stop_options,
+)
 from tests.conftest import make_response_cm
 
 DEFAULT_LINES = ["U1|H", "U1|R"]
+
+
+async def _start_stop_flow(hass: HomeAssistant) -> Any:
+    """Open the user flow and pick the departure-board branch of the menu."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+    assert result["type"] == FlowResultType.MENU
+    return await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"next_step_id": "stop"}
+    )
 
 
 async def _complete_flow(
@@ -49,9 +63,7 @@ async def _complete_flow(
     tests that assert intermediate step transitions (step_id/type checks)
     stay in-line so those assertions remain readable.
     """
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
-    )
+    result = await _start_stop_flow(hass)
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"], {CONF_DIVA: diva}
     )
@@ -67,10 +79,8 @@ async def _complete_flow(
 async def test_full_flow_creates_entry(hass: HomeAssistant, mock_fetch) -> None:
     """Pick stop → pick lines → entry created with correct data."""
     # Step 1: pick Stephansplatz straight out of the catalogue dropdown
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
-    )
-    assert result["step_id"] == "user"
+    result = await _start_stop_flow(hass)
+    assert result["step_id"] == "stop"
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"], {CONF_DIVA: "60201012"}
     )
@@ -103,9 +113,7 @@ async def test_duplicate_entry_aborted(hass: HomeAssistant, mock_fetch) -> None:
 
 async def test_empty_line_selection_rejected(hass: HomeAssistant, mock_fetch) -> None:
     """Submitting the lines step with no lines selected shows `no_lines`."""
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
-    )
+    result = await _start_stop_flow(hass)
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"], {CONF_DIVA: "60201012"}
     )
@@ -118,9 +126,7 @@ async def test_empty_line_selection_rejected(hass: HomeAssistant, mock_fetch) ->
 
 async def test_cannot_connect_during_probe(hass: HomeAssistant) -> None:
     """Live /monitor probe failure surfaces cannot_connect."""
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
-    )
+    result = await _start_stop_flow(hass)
     with patch(
         "custom_components.wiener_linien_austria.config_flow._probe_monitor_lines",
         new_callable=AsyncMock,
@@ -162,6 +168,35 @@ async def test_reconfigure_preserves_unique_id(hass: HomeAssistant, mock_fetch) 
     assert refreshed.data[CONF_SCAN_INTERVAL] == 120
 
 
+async def test_reconfigure_preselects_canonical_line_keys(
+    hass: HomeAssistant, mock_fetch
+) -> None:
+    """A key saved as "LB|H" pre-ticks the picker's "WLB|H" option.
+
+    The picker offers whatever the catalogue now spells the line — the
+    realtime label. An unmapped legacy default matches no option, and the
+    user opens reconfigure to find their own selection gone (issue #110).
+    """
+    await _complete_flow(hass)
+    entry = hass.config_entries.async_entries(DOMAIN)[0]
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, CONF_LINES: ["LB|H", "U1|H"]}
+    )
+
+    flow = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={
+            "source": config_entries.SOURCE_RECONFIGURE,
+            "entry_id": entry.entry_id,
+        },
+    )
+    assert flow["step_id"] == "select_lines"
+    default = next(
+        key.default() for key in flow["data_schema"].schema if str(key) == CONF_LINES
+    )
+    assert default == ["WLB|H", "U1|H"]
+
+
 async def test_options_flow_updates_interval(hass: HomeAssistant, mock_fetch) -> None:
     """Options flow changes only the scan interval."""
     await _complete_flow(hass)
@@ -187,9 +222,7 @@ async def test_catalogue_unavailable_aborts_user_step(hass: HomeAssistant) -> No
         new_callable=AsyncMock,
         side_effect=aiohttp.ClientError("upstream down"),
     ):
-        result = await hass.config_entries.flow.async_init(
-            DOMAIN, context={"source": config_entries.SOURCE_USER}
-        )
+        result = await _start_stop_flow(hass)
     assert result["type"] == FlowResultType.ABORT
     assert result["reason"] == "catalogue_unavailable"
 
@@ -526,9 +559,7 @@ async def test_select_lines_raises_repairs_issue_when_catalogue_fails(
     """Catalogue failure during select_lines must create a Repairs issue."""
     from homeassistant.helpers import issue_registry as ir
 
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
-    )
+    result = await _start_stop_flow(hass)
 
     # The step-1 picker needs the catalogue to render at all, so let the
     # first load succeed and fail only the second — the one select_lines
@@ -576,9 +607,7 @@ async def test_select_lines_clears_repairs_issue_on_recovery(
 
     # Run the flow normally — the autouse mock_static_catalogue fixture
     # makes async_get_catalogue succeed, so the issue should be cleared.
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
-    )
+    result = await _start_stop_flow(hass)
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"], {CONF_DIVA: "60201012"}
     )
@@ -625,10 +654,8 @@ async def test_picker_holds_every_trackable_stop(hass: HomeAssistant) -> None:
     """One field, one option per trackable stop — no separate search step."""
     _set_home(hass, HOME_LATITUDE, HOME_LONGITUDE)
 
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
-    )
-    assert result["step_id"] == "user"
+    result = await _start_stop_flow(hass)
+    assert result["step_id"] == "stop"
     assert _schema_keys(result) == [CONF_DIVA]
 
     options = _options(result)
@@ -652,9 +679,7 @@ async def test_nearby_stops_pinned_first_with_distance(
     """The nearest stops head the list, carrying their distance."""
     _set_home(hass, HOME_LATITUDE, HOME_LONGITUDE)
 
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
-    )
+    result = await _start_stop_flow(hass)
     options = _options(result)
 
     # First three: nearest-first, distance in the label.
@@ -683,9 +708,7 @@ async def test_picker_is_alphabetical_without_a_home_location(
     """A never-onboarded 0/0 home location just drops the pinned block."""
     _set_home(hass, 0.0, 0.0)
 
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
-    )
+    result = await _start_stop_flow(hass)
     options = _options(result)
     assert [o["label"] for o in options] == [
         "Alaudagasse (Wien)",
@@ -708,9 +731,7 @@ async def test_picker_is_alphabetical_when_home_is_far_away(
     """
     _set_home(hass, 47.0707, 15.4395)  # Graz — 145 km out
 
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
-    )
+    result = await _start_stop_flow(hass)
     options = _options(result)
     assert len(options) == 6
     assert options[0]["label"] == "Alaudagasse (Wien)"
@@ -723,9 +744,7 @@ async def test_picking_a_stop_goes_straight_to_lines(
     """One pick is enough to reach line selection and save the entry."""
     _set_home(hass, HOME_LATITUDE, HOME_LONGITUDE)
 
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
-    )
+    result = await _start_stop_flow(hass)
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"], {CONF_DIVA: "60201012"}
     )
@@ -746,9 +765,7 @@ async def test_typed_text_with_several_matches_shows_the_shortlist(
     hass: HomeAssistant,
 ) -> None:
     """Ambiguous free text falls through to the match list, as before."""
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
-    )
+    result = await _start_stop_flow(hass)
     # "gasse" hits Taubstummengasse, Lafitegasse-style names — several stops.
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"], {CONF_DIVA: "gasse"}
@@ -768,9 +785,7 @@ async def test_typed_text_with_one_match_skips_the_shortlist(
     hass: HomeAssistant, mock_fetch
 ) -> None:
     """Unambiguous free text is clear enough — go straight to the lines."""
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
-    )
+    result = await _start_stop_flow(hass)
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"], {CONF_DIVA: "Stephans"}
     )
@@ -780,9 +795,7 @@ async def test_typed_text_with_one_match_skips_the_shortlist(
 
 async def test_search_again_returns_to_step_one(hass: HomeAssistant) -> None:
     """The shortlist keeps its escape hatch back to the picker."""
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
-    )
+    result = await _start_stop_flow(hass)
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"], {CONF_DIVA: "gasse"}
     )
@@ -791,28 +804,24 @@ async def test_search_again_returns_to_step_one(hass: HomeAssistant) -> None:
         result["flow_id"], {CONF_DIVA: "__search_again__"}
     )
     assert result["type"] == FlowResultType.FORM
-    assert result["step_id"] == "user"
+    assert result["step_id"] == "stop"
 
 
 async def test_typed_text_matching_nothing_reports_no_matches(
     hass: HomeAssistant,
 ) -> None:
     """Free text that matches no stop stays on step 1 with a clear error."""
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
-    )
+    result = await _start_stop_flow(hass)
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"], {CONF_DIVA: "XYZ-nope"}
     )
-    assert result["step_id"] == "user"
+    assert result["step_id"] == "stop"
     assert result["errors"][CONF_DIVA] == "no_matches"
 
 
 async def test_typed_text_too_short_is_rejected(hass: HomeAssistant) -> None:
     """A single character is not a search — say so rather than scanning."""
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
-    )
+    result = await _start_stop_flow(hass)
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"], {CONF_DIVA: "a"}
     )
@@ -821,9 +830,7 @@ async def test_typed_text_too_short_is_rejected(hass: HomeAssistant) -> None:
 
 async def test_custom_value_is_enabled_on_the_picker(hass: HomeAssistant) -> None:
     """The picker must accept typed text, not just a pick from the list."""
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
-    )
+    result = await _start_stop_flow(hass)
     for key, validator in result["data_schema"].schema.items():
         if str(key) == CONF_DIVA:
             assert validator.config["custom_value"] is True
@@ -858,11 +865,10 @@ def test_platformless_stops_are_never_offered() -> None:
     )
     # Nearby block and alphabetical remainder must both exclude it.
     assert [
-        s.diva for s, _ in _nearest_stations(catalogue, HOME_LATITUDE, HOME_LONGITUDE)
+        s.diva for s, _ in nearest_stations(catalogue, HOME_LATITUDE, HOME_LONGITUDE)
     ] == [1]
     assert [
-        o["value"]
-        for o in _stop_options(catalogue, HOME_LATITUDE, HOME_LONGITUDE, "en")
+        o["value"] for o in stop_options(catalogue, HOME_LATITUDE, HOME_LONGITUDE, "en")
     ] == ["1"]
 
 
@@ -883,16 +889,16 @@ def test_nearest_stations_honours_limit() -> None:
         },
         last_fetched="2026-04-20T12:00:00+00:00",
     )
-    nearest = _nearest_stations(catalogue, HOME_LATITUDE, HOME_LONGITUDE, limit=2)
+    nearest = nearest_stations(catalogue, HOME_LATITUDE, HOME_LONGITUDE, limit=2)
     assert [station.diva for station, _ in nearest] == [1, 2]
 
 
 def test_format_distance_localises_the_decimal_separator() -> None:
     """Metres below 1 km, kilometres above — with a German decimal comma."""
-    assert _format_distance(72.4, "en") == "70 m"
-    assert _format_distance(846.0, "de") == "850 m"
-    assert _format_distance(1412.0, "en") == "1.4 km"
-    assert _format_distance(1412.0, "de") == "1,4 km"
+    assert format_distance(72.4, "en") == "70 m"
+    assert format_distance(846.0, "de") == "850 m"
+    assert format_distance(1412.0, "en") == "1.4 km"
+    assert format_distance(1412.0, "de") == "1,4 km"
 
 
 def test_same_named_stops_are_disambiguated() -> None:
@@ -934,7 +940,7 @@ def test_same_named_stops_are_disambiguated() -> None:
             lines_at_diva={1: ("U2", "U4", "1", "2", "31"), 2: ("N31",)},
         ),
     )
-    labels = {o["value"]: o["label"] for o in _stop_options(catalogue, 0.0, 0.0, "en")}
+    labels = {o["value"]: o["label"] for o in stop_options(catalogue, 0.0, 0.0, "en")}
     # Truncated at 4 lines — a 14-line hub would be unreadable otherwise.
     assert labels["1"] == "Schottenring (Wien) · U2, U4, 1, 2, …"
     assert labels["2"] == "Schottenring (Wien) · N31"
@@ -968,7 +974,7 @@ def test_identical_line_sets_fall_back_to_the_diva() -> None:
             lines_at_diva={1: ("54A",), 2: ("54A",)},
         ),
     )
-    labels = sorted(o["label"] for o in _stop_options(catalogue, 0.0, 0.0, "en"))
+    labels = sorted(o["label"] for o in stop_options(catalogue, 0.0, 0.0, "en"))
     assert labels == [
         "Lafitegasse (Wien) · 54A · #1",
         "Lafitegasse (Wien) · 54A · #2",
@@ -999,5 +1005,208 @@ def test_collision_without_line_data_still_resolves() -> None:
         },
         last_fetched="2026-04-20T12:00:00+00:00",
     )
-    labels = sorted(o["label"] for o in _stop_options(catalogue, 0.0, 0.0, "en"))
+    labels = sorted(o["label"] for o in stop_options(catalogue, 0.0, 0.0, "en"))
     assert labels == ["Kirchengasse (Wien) · #1", "Kirchengasse (Wien) · #2"]
+
+
+# ---------------------------------------------------------------------------
+# _static_lines_for_station — the filters that keep the picker honest
+# ---------------------------------------------------------------------------
+
+
+def _station(diva: int, name: str, rbls: list[int]) -> Station:
+    return Station(
+        diva=diva,
+        name=name,
+        municipality="Wien",
+        longitude=16.37,
+        latitude=48.20,
+        rbls=rbls,
+    )
+
+
+def test_static_lines_skips_a_pattern_that_misses_this_station() -> None:
+    """A line can have short-turn and branch patterns that never call here.
+
+    Listing them would offer the user a direction their platform does not
+    actually serve, which then never produces a departure.
+    """
+    here = _station(1, "Hier", [100])
+    elsewhere = _station(2, "Woanders", [200])
+    terminus = _station(3, "Endstelle", [300])
+    catalogue = StaticCatalogue(
+        stations_by_diva={1: here, 2: elsewhere, 3: terminus},
+        last_fetched="t",
+        trip_patterns=TripPatternIndex(
+            patterns_by_line={
+                7: [
+                    # Does not touch RBL 100.
+                    TripPattern(line_id=7, pattern_id=1, direction=1, stops=(200, 300)),
+                ]
+            },
+            lines_by_label={"U7": 7},
+            means_by_line={7: "ptMetro"},
+            lines_at_diva={1: ("U7",)},
+        ),
+    )
+
+    assert _static_lines_for_station(catalogue, here) == []
+
+
+def test_static_lines_skips_a_pattern_terminating_here() -> None:
+    """ "U1 → Westbahnhof" while standing at Westbahnhof is noise.
+
+    The live /monitor never emits it — the vehicle has already arrived —
+    so it only ever appears via the static merge, and only as a mistake.
+    """
+    here = _station(1, "Westbahnhof", [100])
+    catalogue = StaticCatalogue(
+        stations_by_diva={1: here},
+        last_fetched="t",
+        trip_patterns=TripPatternIndex(
+            patterns_by_line={
+                7: [
+                    # Terminates at this station's own RBL.
+                    TripPattern(line_id=7, pattern_id=1, direction=1, stops=(50, 100)),
+                ]
+            },
+            lines_by_label={"U7": 7},
+            means_by_line={7: "ptMetro"},
+            lines_at_diva={1: ("U7",)},
+        ),
+    )
+
+    assert _static_lines_for_station(catalogue, here) == []
+
+
+def test_static_lines_skips_an_unknown_line_label() -> None:
+    """`lines_at_diva` naming a label absent from `lines_by_label`.
+
+    Reachable on a half-migrated cache, where the two indexes were built
+    by different versions of the parser.
+    """
+    here = _station(1, "Hier", [100])
+    catalogue = StaticCatalogue(
+        stations_by_diva={1: here},
+        last_fetched="t",
+        trip_patterns=TripPatternIndex(
+            patterns_by_line={},
+            lines_by_label={},
+            means_by_line={},
+            lines_at_diva={1: ("U99",)},
+        ),
+    )
+
+    assert _static_lines_for_station(catalogue, here) == []
+
+
+def test_static_lines_skips_a_pattern_whose_terminus_has_no_name() -> None:
+    """No resolvable terminus name means no usable `towards` label.
+
+    Offering a direction with a blank destination is worse than omitting
+    it: the user cannot tell the two directions apart in the picker.
+    """
+    here = _station(1, "Hier", [100])
+    catalogue = StaticCatalogue(
+        stations_by_diva={1: here},
+        last_fetched="t",
+        trip_patterns=TripPatternIndex(
+            patterns_by_line={
+                7: [
+                    # RBL 999 belongs to no station in the catalogue.
+                    TripPattern(line_id=7, pattern_id=1, direction=1, stops=(100, 999)),
+                ]
+            },
+            lines_by_label={"U7": 7},
+            means_by_line={7: "ptMetro"},
+            lines_at_diva={1: ("U7",)},
+        ),
+    )
+
+    assert _static_lines_for_station(catalogue, here) == []
+
+
+def test_static_lines_dedupes_two_patterns_in_the_same_direction() -> None:
+    """Branches sharing a direction collapse to one picker row.
+
+    Keys are `{line}|{direction}`, so a second pattern in the same
+    direction would otherwise produce a duplicate the user cannot
+    distinguish.
+    """
+    here = _station(1, "Hier", [100])
+    a = _station(2, "Endstelle A", [200])
+    b = _station(3, "Endstelle B", [300])
+    catalogue = StaticCatalogue(
+        stations_by_diva={1: here, 2: a, 3: b},
+        last_fetched="t",
+        trip_patterns=TripPatternIndex(
+            patterns_by_line={
+                7: [
+                    TripPattern(line_id=7, pattern_id=1, direction=1, stops=(100, 200)),
+                    TripPattern(line_id=7, pattern_id=2, direction=1, stops=(100, 300)),
+                ]
+            },
+            lines_by_label={"U7": 7},
+            means_by_line={7: "ptMetro"},
+            lines_at_diva={1: ("U7",)},
+        ),
+    )
+
+    rows = _static_lines_for_station(catalogue, here)
+
+    assert [r["key"] for r in rows] == ["U7|H"]
+
+
+# ---------------------------------------------------------------------------
+# _probe_monitor_lines — upstream shapes that must not raise
+# ---------------------------------------------------------------------------
+
+
+def _probe_response(body: object) -> MagicMock:
+    """A mock /monitor response carrying `body`.
+
+    `make_response_cm` wraps a response object, not a body — the probe
+    calls `raise_for_status()` before `json()`, so both have to exist.
+    """
+    resp = MagicMock()
+    resp.status = 200
+    resp.raise_for_status = MagicMock()
+    resp.json = AsyncMock(return_value=body)
+    return make_response_cm(resp)
+
+
+async def test_probe_returns_empty_on_a_non_dict_body(hass: HomeAssistant) -> None:
+    """A JSON array or scalar where an object was expected."""
+    with patch(
+        "custom_components.wiener_linien_austria.config_flow.async_get_clientsession"
+    ) as session:
+        session.return_value.get.return_value = _probe_response(["not", "a", "dict"])
+        assert await _probe_monitor_lines(hass, [4111]) == []
+
+
+async def test_probe_returns_empty_on_an_error_message_code(
+    hass: HomeAssistant,
+) -> None:
+    """Anything but messageCode 1 (or absent) means the payload is not data.
+
+    Code 316 is the rate limit; treating its body as a stop with no lines
+    would silently offer the user an empty picker.
+    """
+    with patch(
+        "custom_components.wiener_linien_austria.config_flow.async_get_clientsession"
+    ) as session:
+        session.return_value.get.return_value = _probe_response(
+            {"message": {"messageCode": 316}, "data": {"monitors": []}}
+        )
+        assert await _probe_monitor_lines(hass, [4111]) == []
+
+
+async def test_probe_returns_empty_on_a_transport_failure(
+    hass: HomeAssistant,
+) -> None:
+    """Probing is best-effort — the flow falls back to the static picker."""
+    with patch(
+        "custom_components.wiener_linien_austria.config_flow.async_get_clientsession"
+    ) as session:
+        session.return_value.get.side_effect = aiohttp.ClientError("boom")
+        assert await _probe_monitor_lines(hass, [4111]) == []

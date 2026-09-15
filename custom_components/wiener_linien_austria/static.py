@@ -1,7 +1,7 @@
 """Static OGD data: stop catalogue, DIVA → RBL mapping, and line trip patterns.
 
 Wiener Linien publishes a handful of CSVs at the same base URL as the realtime
-API. We use four of them:
+API. We use five of them:
 
 - `haltestellen.csv`     — one row per station (DIVA, name, coordinates).
 - `haltepunkte.csv`      — one row per physical platform (RBL = StopID, parent
@@ -12,9 +12,18 @@ API. We use four of them:
   trip-pattern CSV, and exposes the canonical vehicle type per line.
 - `fahrwegverlaeufe.csv` — ordered RBL sequence per (LineID, PatternID,
   Direction). Powers the per-departure "stops ahead" enrichment.
+- `gtfs/routes.txt`      — GTFS route table: `route_color` / `route_text_color`
+  per line label. Drives the cards' per-line palette; the only one of the five
+  published under `doku/ogd/gtfs/`.
 
 The catalogue is stable for days/weeks at a time so we fetch it once, cache it
 on disk via `homeassistant.helpers.storage.Store`, and refresh weekly.
+
+The refresh takes the domain-wide cooldown once for the whole five-file burst
+(see `_fetch_and_build`), so a weekly background refresh cannot land on top of
+a `/monitor` tick. It does not take the cooldown per file — that would trade a
+one-off 15 s wait for a 75 s serialised drain, which is worse for both us and
+the upstream.
 """
 
 from __future__ import annotations
@@ -25,12 +34,12 @@ import io
 import json
 import logging
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NamedTuple
 
 import aiohttp
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
@@ -38,11 +47,19 @@ from homeassistant.util import dt as dt_util
 from .const import (
     DOMAIN,
     ENTRY_COUNT_KEY,
+    GTFS_LINE_LABEL_ALIASES,
+    LEGACY_LINE_LABELS,
     MAX_STOPS_AHEAD,
+    REALTIME_LINE_LABELS,
+    S_BAHN_COLORS,
+    S_BAHN_DEFAULT_COLOR,
+    S_BAHN_TEXT_COLOR,
     STATIC_FILES,
     USER_AGENT,
 )
-from .http import CacheValidators, base_request_headers
+from .http import base_request_headers
+from .rate_limit import async_enforce_domain_cooldown
+from .s_bahn_network import merge_transfer_lines
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -57,14 +74,19 @@ _LINE_BUS_DAY_RE = re.compile(r"^\d+[A-Z]+$")
 _LINE_SORT_LETTER_TIE = 10**9  # sentinel: letter-only labels rank after numerics
 
 # Mode-of-transport sort tiers — applied first so the lines_at_diva
-# changeover chips group by colour-coded mode (Metro → Tram → Bus →
-# Nightline) rather than interleaving every mode by number alone.
-# Matches the GTFS palette tiers the card now renders.
+# changeover chips group by colour-coded mode (Metro → Tram → Badner Bahn
+# → Bus → Nightline) rather than interleaving every mode by number alone.
+# Matches the GTFS palette tiers the cards render.
+#
+# linien.csv tags the Badner Bahn (LineID 399) "ptTramWLB", not "ptTram".
+# Without its own tier it took the unknown sentinel and sorted after the
+# nightlines on the stops-ahead chips.
 _MOT_SORT_RANK: dict[str, int] = {
     "ptMetro": 0,
     "ptTram": 1,
-    "ptBusCity": 2,
-    "ptBusNight": 3,
+    "ptTramWLB": 2,
+    "ptBusCity": 3,
+    "ptBusNight": 4,
 }
 # Sentinel for unknown MoT values — derived from the table size so it
 # always ranks AFTER every defined tier, even if Wiener Linien adds a
@@ -104,17 +126,15 @@ def _heuristic_mot(label: str) -> str | None:
     return "ptTram"
 
 
-def _line_sort_key(label: str, mot: str | None = None) -> tuple[int, int, int, str]:
+def _line_sort_key(label: str, mot: str | None = None) -> tuple[int, int, str]:
     """Return a sort key for a Wiener Linien line label.
 
-    Tier 1 — mode of transport (Metro → Tram → BusCity → BusNight →
-    unknown). Groups colour-coded modes together on the per-stop
-    changeover chips. When `mot` is None, falls back to a label-format
-    heuristic (`_heuristic_mot`) so callers without an authoritative
-    lookup still produce sensible ordering.
-    Tier 2 — leading-digit integer (so "2" < "10" < "13A"); letter-only
-    labels fall to the sentinel and sort alphabetically among themselves.
-    Tier 3 — full remaining label so "13A" < "13B".
+    mot_rank — mode of transport (Metro → Tram → BusCity → BusNight →
+    unknown), so the per-stop changeover chips group by colour-coded mode.
+    Falls back to `_heuristic_mot` when no authoritative lookup is given.
+    numeric  — leading-digit integer (so "2" < "10" < "13A"); letter-only
+    labels take the sentinel and sort alphabetically among themselves.
+    rest     — full remaining label so "13A" < "13B".
     """
     resolved_mot = mot or _heuristic_mot(label)
     mot_rank = (
@@ -124,16 +144,13 @@ def _line_sort_key(label: str, mot: str | None = None) -> tuple[int, int, int, s
     )
     # Strip the mode-letter prefix from the body so within-mode sort is
     # purely numeric: "U1" / "U6" sort by 1 / 6, not as letter-only.
-    if resolved_mot in ("ptMetro", "ptBusNight"):
-        body = label[1:]
-    else:
-        body = label
+    body = label[1:] if resolved_mot in ("ptMetro", "ptBusNight") else label
     match = _LINE_LEADING_DIGITS_RE.match(body)
     if match is None:  # never happens — re matches empty string too
-        return (mot_rank, 0, _LINE_SORT_LETTER_TIE, body)
+        return (mot_rank, _LINE_SORT_LETTER_TIE, body)
     digits, rest = match.group(1), match.group(2)
     numeric = int(digits) if digits else _LINE_SORT_LETTER_TIE
-    return (mot_rank, 0, numeric, rest)
+    return (mot_rank, numeric, rest)
 
 
 def _sort_line_labels(
@@ -236,6 +253,15 @@ class TripPatternIndex:
     # stops_ahead matcher does this once per departure row) get O(1)
     # instead of an O(N) iteration over `lines_by_label.items()`.
     label_for_line: dict[int, str] = field(default_factory=dict, repr=False)
+    # RBL → labels of every line whose schedule calls at that platform, plus
+    # the label → MoT map used to sort them. Built lazily by `lines_at_rbls`:
+    # only the stop-display notice matcher reads them, so building on every
+    # construction would tax each store load for nothing. Not persisted —
+    # both derive from the fields above.
+    _labels_by_rbl: dict[int, frozenset[str]] | None = field(
+        default=None, repr=False, compare=False
+    )
+    _label_mot: dict[str, str] = field(default_factory=dict, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         """Build the LineID→label reverse index at construction.
@@ -257,6 +283,47 @@ class TripPatternIndex:
         """Total number of TripPattern variants across all lines."""
         return sum(len(v) for v in self.patterns_by_line.values())
 
+    def lines_at_rbls(self, rbls: Iterable[int]) -> tuple[str, ...] | None:
+        """Labels of every line whose schedule calls at any of `rbls`.
+
+        The platform-level counterpart to `lines_at_diva`. A hub DIVA holds
+        U-Bahn, tram and bus platforms alike, and a stop-display notice names
+        platforms, not lines — Westbahnhof's RBL 464 is a Gürtel tram
+        platform no U3 train ever calls at. Sorted like `lines_at_diva`.
+
+        Returns None when none of `rbls` appears in any pattern: "the
+        schedule doesn't know this platform" is not "no line calls here",
+        and callers fall back to their pre-index behaviour on it.
+        """
+        by_rbl = self._ensure_labels_by_rbl()
+        known = False
+        labels: set[str] = set()
+        for rbl in rbls:
+            hit = by_rbl.get(rbl)
+            if hit is not None:
+                known = True
+                labels.update(hit)
+        if not known:
+            return None
+        return _sort_line_labels(labels, self._label_mot)
+
+    def _ensure_labels_by_rbl(self) -> dict[int, frozenset[str]]:
+        """Build the RBL → labels index on first use."""
+        if self._labels_by_rbl is not None:
+            return self._labels_by_rbl
+        by_rbl: dict[int, set[str]] = {}
+        for line_id, patterns in self.patterns_by_line.items():
+            label = self.label_for_line.get(line_id)
+            if not label:
+                continue
+            for pattern in patterns:
+                for rbl in pattern.stops:
+                    by_rbl.setdefault(rbl, set()).add(label)
+        built = {rbl: frozenset(labels) for rbl, labels in by_rbl.items()}
+        self._label_mot = _mot_by_label(self.lines_by_label, self.means_by_line)
+        self._labels_by_rbl = built
+        return built
+
 
 @dataclass(slots=True)
 class StaticCatalogue:
@@ -264,15 +331,14 @@ class StaticCatalogue:
 
     `stations_by_diva` maps DIVA → Station (with its rbls populated).
     `last_fetched` is the UTC timestamp of the successful fetch that built it.
-    `validators` is the per-CSV (ETag, Last-Modified) pair captured from the
-    last successful fetch so the next refresh can short-circuit on 304.
     `trip_patterns` is None on caches written before v1.4 (the field was
     introduced additively); the next refresh fills it in.
+
+    Old Store payloads may carry a `validators` key; it is ignored on read.
     """
 
     stations_by_diva: dict[int, Station]
     last_fetched: str  # ISO 8601 UTC
-    validators: dict[str, CacheValidators] = field(default_factory=dict)
     trip_patterns: TripPatternIndex | None = None
     # Reverse index: RBL → (DIVA, station name). Built eagerly in
     # `__post_init__` so concurrent first-access from two coroutines
@@ -309,6 +375,21 @@ class StaticCatalogue:
     def index_by_rbl(self) -> dict[int, tuple[int, str]]:
         """Return the eager RBL → (DIVA, station name) reverse index."""
         return self._rbl_index
+
+
+# What `async_get_catalogue` can raise when neither the cache nor the network
+# can produce a catalogue: a download timeout or transport error, a malformed
+# CSV (KeyError / TypeError / ValueError), or the RuntimeError the loader
+# raises when both sources are out. Coordinators that treat the catalogue as
+# optional catch exactly this set, so a new failure mode is added here once.
+CATALOGUE_LOAD_ERRORS: tuple[type[Exception], ...] = (
+    TimeoutError,
+    aiohttp.ClientError,
+    KeyError,
+    TypeError,
+    ValueError,
+    RuntimeError,
+)
 
 
 async def async_get_catalogue(hass: HomeAssistant) -> StaticCatalogue:
@@ -359,24 +440,87 @@ async def async_get_catalogue(hass: HomeAssistant) -> StaticCatalogue:
 def async_set_cached_catalogue(hass: HomeAssistant, catalogue: StaticCatalogue) -> None:
     """Replace the shared catalogue ref (called by the periodic refresher).
 
-    Existing coordinators continue to hold their captured ref from setup
-    — acceptable because trip patterns / stops / RBLs change on a
-    weeks-to-months cadence. This call ensures only that *new*
-    coordinators (after entry reload) and the next config-flow
-    invocation see the refreshed data.
+    Every reader looks the ref up on use (coordinators, sensors, live.py,
+    the config flow), so the refreshed data is picked up without a reload.
+    The exception is a stop's coordinates, which its coordinator captures
+    at setup.
 
     No-op when the integration has been torn down (no entries left). A
     background refresh task spawned earlier may otherwise complete
     after `async_unload_entry` ran and re-poison `hass.data[DOMAIN]`
-    with a catalogue we just deliberately dropped. Checks the *value*
-    of `ENTRY_COUNT_KEY`, not just its presence — last-unload sets it
-    to 0 (rather than popping it) so a presence-only check would
-    silently let the race through.
+    with a catalogue we just deliberately dropped; see `domain_is_live`.
+    """
+    if not domain_is_live(hass):
+        return
+    hass.data[DOMAIN][CATALOGUE_KEY] = catalogue
+
+
+@callback
+def domain_is_live(hass: HomeAssistant) -> bool:
+    """True while at least one config entry of this integration is loaded.
+
+    The guard for background work that finishes after an unload: a task
+    must not write into `hass.data[DOMAIN]` once the last entry is gone, or
+    it re-creates state the teardown just dropped. Checks the *value* of
+    `ENTRY_COUNT_KEY`, not just its presence — last-unload sets it to 0
+    (rather than popping it) so a presence-only check would silently let
+    the race through.
     """
     domain_data = hass.data.get(DOMAIN)
-    if not domain_data or not domain_data.get(ENTRY_COUNT_KEY):
-        return
-    domain_data[CATALOGUE_KEY] = catalogue
+    return bool(domain_data and domain_data.get(ENTRY_COUNT_KEY))
+
+
+@callback
+def current_catalogue(hass: HomeAssistant) -> StaticCatalogue | None:
+    """The loaded stop catalogue, or None while it's still loading.
+
+    The slot may hold a resolved `StaticCatalogue`, an `asyncio.Task` (still
+    loading on a fresh start), or nothing (no load triggered yet). Only the
+    resolved form is useful to readers; the others come back as None, and
+    each caller degrades on its own terms (the parser skips stops_ahead, the
+    sensor falls back to live-derived lines).
+    """
+    catalogue = hass.data.get(DOMAIN, {}).get(CATALOGUE_KEY)
+    return catalogue if isinstance(catalogue, StaticCatalogue) else None
+
+
+def canonical_line_label(label: str) -> str:
+    """Map a line label onto the spelling the realtime feed uses.
+
+    `linien.csv` and `/monitor` disagree on a couple of lines (the Badner
+    Bahn is "LB" in the catalogue and "WLB" on every departure). The
+    catalogue itself is normalised at parse time, so this exists for the
+    values that were written down *before* that happened — saved
+    `CONF_LINES` selections, and everything derived from them. Anything
+    already canonical, or not in the table, passes through unchanged.
+    """
+    return LEGACY_LINE_LABELS.get(label, label)
+
+
+def canonical_line_key(key: str) -> str:
+    """`canonical_line_label` applied to a `{line}|{direction}` key.
+
+    Keys with no pipe are returned as-is — they are malformed and would
+    never match a live row anyway, so this is not the place to reject them.
+    """
+    label, sep, rest = key.partition("|")
+    canonical = LEGACY_LINE_LABELS.get(label)
+    return key if canonical is None else f"{canonical}{sep}{rest}"
+
+
+def _has_stale_line_labels(index: TripPatternIndex) -> bool:
+    """True when a cached index still spells a line the way linien.csv does.
+
+    Compares the cache's own label for each aliased `LineID` against
+    `REALTIME_LINE_LABELS`. A cache written before the table existed keeps
+    "LB" for LineID 399 and answers True; one written after keeps "WLB"
+    and answers False. Lines the cache doesn't know are ignored — an
+    absent LineID is not a stale label.
+    """
+    return any(
+        index.label_for_line.get(line_id) == legacy
+        for line_id, (legacy, _live) in REALTIME_LINE_LABELS.items()
+    )
 
 
 async def async_load_catalogue(hass: HomeAssistant) -> StaticCatalogue:
@@ -433,6 +577,15 @@ async def async_load_catalogue(hass: HomeAssistant) -> StaticCatalogue:
                 # isn't stuck on the fallback palette until the next
                 # weekly tick.
                 (tp is not None and not tp.colors_by_line, "missing route colours"),
+                # Cache predates `REALTIME_LINE_LABELS` (or the table has
+                # grown since it was written), so it still carries the
+                # linien.csv spelling for a line the realtime feed names
+                # differently. Left alone, the picker keeps offering "LB"
+                # while every departure says "WLB".
+                (
+                    tp is not None and _has_stale_line_labels(tp),
+                    "line labels predate the realtime alias table",
+                ),
             )
             needs_refresh_reason = next(
                 (reason for cond, reason in migration_tells if cond),
@@ -491,22 +644,19 @@ async def _async_background_refresh(
 ) -> None:
     """Background-task helper: refresh + persist + publish the catalogue.
 
-    Catches every refresh failure mode (network, timeout, parse, cancel)
-    and logs at WARNING. On success, writes the new payload to Store and
-    swaps the shared catalogue ref so coordinators that read it live see
-    the refreshed data on their next parse.
-
-    Lost-update guard: if the weekly `async_refresh_catalogue` published
-    a newer catalogue while this slow migration was still fetching, the
-    result built here is discarded rather than clobbering the fresher
-    data on disk and in memory.
+    Catches every refresh failure mode (network, timeout, parse) and logs
+    at WARNING; cancellation propagates untouched, so an HA shutdown
+    landing mid-fetch is honoured. On success, writes the new payload to
+    Store and swaps the shared catalogue ref so coordinators that read it
+    live see the refreshed data on their next parse. See the lost-update
+    guard below for what it declines to publish.
     """
     try:
         refreshed = await _fetch_and_build(hass, prior=prior)
     except asyncio.CancelledError:
         # HA stopping or task explicitly cancelled — don't log noisily.
         raise
-    except Exception as err:  # noqa: BLE001
+    except Exception as err:  # noqa: BLE001 — background task safety net
         # Network, parse, schema-surprise — none should crash the
         # integration. Log + retry on the next weekly tick.
         _LOGGER.warning(
@@ -514,11 +664,6 @@ async def _async_background_refresh(
             type(err).__name__,
             err,
         )
-        return
-    if refreshed is prior:
-        # Nothing changed (e.g. every CSV returned 304). No write, and
-        # no re-publish — re-publishing `prior` could itself clobber a
-        # newer catalogue the weekly refresh installed meanwhile.
         return
     # Lost-update guard: this background fetch started from `prior`, but
     # the weekly `async_refresh_catalogue` may have fetched and published
@@ -559,7 +704,7 @@ async def _async_background_refresh(
 async def async_refresh_catalogue(hass: HomeAssistant) -> StaticCatalogue | None:
     """Best-effort refresh: on network failure, keep the existing cache.
 
-    Returns the new catalogue on success, None on failure or 304.
+    Returns the new catalogue on success, None on failure.
     """
     store: Store[dict[str, Any]] = Store(hass, STORE_VERSION, STORE_KEY)
     try:
@@ -583,12 +728,10 @@ async def async_refresh_catalogue(hass: HomeAssistant) -> StaticCatalogue | None
         _LOGGER.warning("Static catalogue refresh failed, keeping cache: %s", err)
         return None
 
-    # _fetch_and_build returns the prior catalogue verbatim when every CSV
-    # came back 304 — no parse, no diff, just skip the Store write too.
-    if prior is not None and catalogue is prior:
-        _LOGGER.debug("Static catalogue unchanged (all CSVs 304); skipping rewrite")
-        return None
-
+    # Every refresh now rewrites the Store. There is no unchanged fast path
+    # to skip it: the upstream never answers 304, so `_fetch_and_build`
+    # always returns a freshly parsed catalogue. The write is one file per
+    # week, so buying a skip with a content hash isn't worth the branch.
     try:
         await store.async_save(_catalogue_to_store(catalogue))
     except OSError as err:
@@ -602,166 +745,107 @@ async def async_refresh_catalogue(hass: HomeAssistant) -> StaticCatalogue | None
 async def _fetch_and_build(
     hass: HomeAssistant, prior: StaticCatalogue | None
 ) -> StaticCatalogue:
-    """Download the four OGD CSVs, merge into a StaticCatalogue.
+    """Download the five OGD static files, merge into a StaticCatalogue.
 
-    When `prior` is set, sends If-None-Match / If-Modified-Since per file.
-    If *every* CSV replies 304, returns `prior` unchanged so the caller can
-    skip the disk write. The trip-pattern CSV pair (linien + fahrwegverlaeufe)
-    is fail-soft: if either download throws, the existing trip_patterns from
-    `prior` are preserved and stations/RBLs still refresh.
+    The trip-pattern CSV pair (linien + fahrwegverlaeufe) and the GTFS colour
+    table are fail-soft: if a download throws, the corresponding index from
+    `prior` is preserved and stations/RBLs still refresh.
+
+    Every refresh downloads full bodies. There is no conditional-GET path:
+    the upstream never answers 304, and its `Last-Modified` is synthetic and
+    rounded to the hour, so it could not gate a weekly refresh even if the
+    validators were honoured. `http.py` records the measurements.
+
+    Weekly cost, measured 2026-09-07: fahrwegverlaeufe 1,498,715 B +
+    haltepunkte 337,502 + haltestellen 127,010 + routes.txt 10,207 on the
+    wire (73,622 raw — the only one of the five the origin gzips) + linien
+    4,990, so ~1.89 MB. For scale that is ~7% of one week of `/monitor`
+    polling at the default 60 s cadence, which is why this refresh is not
+    where the bytes are. (That ratio predates route leases, which add stops
+    to the `/monitor` request, so today's share is if anything smaller.)
     """
     session = async_get_clientsession(hass)
     timeout = aiohttp.ClientTimeout(total=30)
 
-    halte_validators = (
-        prior.validators.get("haltestellen") if prior else None
-    ) or CacheValidators()
-    punkte_validators = (
-        prior.validators.get("haltepunkte") if prior else None
-    ) or CacheValidators()
-    # Force a full body for linien + fahrwegverlaeufe whenever we don't
-    # yet have a fully-built trip-pattern index. Stale validators would
-    # otherwise trigger a 304 with an empty body, leaving us unable to
-    # rebuild the missing parts this cycle and stuck on weekly cadence
-    # until BOTH CSVs happen to flip fresh in the same tick. Empty
-    # `lines_at_diva` is the migration tell for caches written before
-    # that index existed; without this branch the migration loops
-    # 304→304 forever.
-    needs_pattern_bodies = (
-        prior is None
-        or prior.trip_patterns is None
-        or not prior.trip_patterns.lines_at_diva
-    )
-    linien_validators = _pick_validators(prior, "linien", force=needs_pattern_bodies)
-    fahr_validators = _pick_validators(
-        prior, "fahrwegverlaeufe", force=needs_pattern_bodies
-    )
-    # Same logic for the colour map: if we don't have it yet, force-fetch.
-    needs_routes_body = prior is None or not (
-        prior.trip_patterns and prior.trip_patterns.colors_by_line
-    )
-    routes_validators = _pick_validators(prior, "routes", force=needs_routes_body)
+    # One cooldown slot for the whole burst, not one per file. The five
+    # downloads then run concurrently inside it: taking the lock per file
+    # would serialise them into 5 x DOMAIN_COOLDOWN_SECONDS of held lock
+    # once a week, stalling every `/monitor` tick behind a background
+    # refresh that is explicitly allowed to fail soft. Taking it once keeps
+    # the burst from landing on top of a monitor tick, which is the part
+    # that actually matters to the upstream.
+    await async_enforce_domain_cooldown(hass)
 
     (
-        haltestellen_result,
-        haltepunkte_result,
+        halte_text,
+        punkte_text,
         linien_result,
         fahr_result,
         routes_result,
     ) = await asyncio.gather(
-        _download_text(
-            session, STATIC_FILES["haltestellen"], timeout, halte_validators
-        ),
-        _download_text(
-            session, STATIC_FILES["haltepunkte"], timeout, punkte_validators
-        ),
-        _download_or_fail_soft(
-            session, STATIC_FILES["linien"], timeout, linien_validators
-        ),
-        _download_or_fail_soft(
-            session,
-            STATIC_FILES["fahrwegverlaeufe"],
-            timeout,
-            fahr_validators,
-        ),
-        _download_or_fail_soft(
-            session, STATIC_FILES["routes"], timeout, routes_validators
-        ),
+        _download_text(session, STATIC_FILES["haltestellen"], timeout),
+        _download_text(session, STATIC_FILES["haltepunkte"], timeout),
+        _download_or_fail_soft(session, STATIC_FILES["linien"], timeout),
+        _download_or_fail_soft(session, STATIC_FILES["fahrwegverlaeufe"], timeout),
+        _download_or_fail_soft(session, STATIC_FILES["routes"], timeout),
     )
 
-    halte_text, halte_validators_new = haltestellen_result
-    punkte_text, punkte_validators_new = haltepunkte_result
-    linien_text, linien_validators_new, linien_failed = linien_result
-    fahr_text, fahr_validators_new, fahr_failed = fahr_result
-    routes_text, routes_validators_new, routes_failed = routes_result
+    linien_text, linien_failed = linien_result
+    fahr_text, fahr_failed = fahr_result
+    routes_text, routes_failed = routes_result
 
-    # All-304 fast path: only valid if every optional fetch actually
-    # happened (not failed) and also returned 304. A failed fetch is NOT
-    # the same as 304 — we lose the freshness signal, so we fall through
-    # and rebuild from prior. `prior is not None` guards the early return
-    # so mypy can narrow the return type without a `# type: ignore`.
-    if prior is not None and (
-        halte_text is None
-        and punkte_text is None
-        and linien_text is None
-        and fahr_text is None
-        and routes_text is None
-        and not linien_failed
-        and not fahr_failed
-        and not routes_failed
-    ):
-        return prior
+    # One executor hop for the whole parse block, not one per parser.
+    # Measured against live upstream data on Apple silicon: haltestellen
+    # 3.9 ms + haltepunkte 7.5 ms + trip patterns 123.9 ms + route colours
+    # 1.6 ms = ~137 ms, which projects to roughly 0.5-0.9 s on a Pi 4 —
+    # well past the point HA starts complaining about a blocked event loop,
+    # on first setup (where the user is watching a config-flow spinner) and
+    # again on every weekly refresh. The cost is almost entirely
+    # fahrwegverlaeufe.csv at ~87,000 rows.
+    #
+    # Why one hop: `_merge_haltepunkte` mutates the `stations` dict in
+    # place and `_parse_trip_patterns` reads it, so splitting the block
+    # into three hops would push that mutation across a thread boundary
+    # twice for no benefit. `_parse_all` is pure — it touches neither
+    # `hass` nor `_LOGGER` — so every warning below stays on the loop.
+    parsed = await hass.async_add_executor_job(
+        _parse_all, halte_text, punkte_text, linien_text, fahr_text, routes_text
+    )
+    stations = parsed.stations
 
-    # Stations: either freshly parsed or carried over from prior unchanged.
-    if halte_text is None and prior is not None:
-        stations = {
-            diva: Station(
-                diva=s.diva,
-                name=s.name,
-                municipality=s.municipality,
-                longitude=s.longitude,
-                latitude=s.latitude,
-                rbls=[],  # rebuilt below from fresh haltepunkte
-            )
-            for diva, s in prior.stations_by_diva.items()
-        }
-    elif halte_text is not None:
-        stations = _parse_haltestellen(halte_text)
-    else:
-        # No prior, no fresh — shouldn't happen, but be defensive.
-        stations = {}
-
-    if punkte_text is not None:
-        _merge_haltepunkte(stations, punkte_text)
-    elif prior is not None:
-        # Reuse prior RBL assignments since haltepunkte didn't change.
-        for diva, s in stations.items():
-            prior_station = prior.stations_by_diva.get(diva)
-            if prior_station is not None:
-                s.rbls = list(prior_station.rbls)
-
-    # Trip-pattern index: re-parse only when at least one of the two source
-    # CSVs came back fresh AND neither failed. On any failure / both-304,
-    # carry the prior index forward unchanged. Carrying prior is the
+    # Trip-pattern index: rebuild only when both source CSVs downloaded and
+    # parsed. On any failure, carry the prior index forward unchanged. Carrying prior is the
     # important fail-soft guarantee — a temporary fetch hiccup must not
     # wipe the stops_ahead feature for the next 7 days.
     trip_patterns = prior.trip_patterns if prior is not None else None
     pattern_status = "preserved"
-    if not linien_failed and not fahr_failed:
-        if linien_text is not None or fahr_text is not None or prior is None:
-            # Need both bodies to (re)build. If exactly one is 304, we have
-            # to refetch the other unconditionally — simpler to just skip
-            # the rebuild and keep the prior index. The next weekly refresh
-            # will catch any change.
-            if linien_text is not None and fahr_text is not None:
-                try:
-                    trip_patterns = _parse_trip_patterns(
-                        linien_text, fahr_text, stations
-                    )
-                    pattern_status = "fresh"
-                except (KeyError, ValueError) as err:
-                    _LOGGER.warning(
-                        "Trip-pattern CSV parse failed, keeping prior index: %s",
-                        err,
-                    )
-            elif prior is None:
-                # First-ever load: only one of the two arrived. Skip the
-                # index for this cycle; next refresh will complete it.
-                trip_patterns = None
-                pattern_status = "partial-skip"
+    if linien_text is not None and fahr_text is not None:
+        if parsed.trip_pattern_error is not None:
+            _LOGGER.warning(
+                "Trip-pattern CSV parse failed, keeping prior index: %s",
+                parsed.trip_pattern_error,
+            )
+        else:
+            trip_patterns = parsed.trip_patterns
+            pattern_status = "fresh"
     else:
         pattern_status = "fetch-failed"
 
     # Route colours (GTFS routes.txt). Independent of the trip-pattern
     # rebuild — the colour map only depends on routes.txt, so a fresh
-    # routes payload can refresh colours even when linien/fahr were 304.
+    # routes payload can refresh colours even when linien/fahr failed.
     # Attached onto whichever TripPatternIndex we end up returning so
     # the card has a single per-line catalogue to read.
     color_status = "preserved"
     if trip_patterns is not None:
-        if routes_text is not None and not routes_failed:
-            try:
-                bg, fg = _parse_route_colors(routes_text)
+        if routes_text is not None:
+            if parsed.route_color_error is not None:
+                _LOGGER.warning(
+                    "Route-colour CSV parse failed, keeping prior colours: %s",
+                    parsed.route_color_error,
+                )
+            elif parsed.route_colors is not None:
+                bg, fg = parsed.route_colors
                 trip_patterns = TripPatternIndex(
                     patterns_by_line=trip_patterns.patterns_by_line,
                     lines_by_label=trip_patterns.lines_by_label,
@@ -771,38 +855,24 @@ async def _fetch_and_build(
                     text_colors_by_line=fg,
                 )
                 color_status = "fresh"
-            except (KeyError, ValueError) as err:
-                _LOGGER.warning(
-                    "Route-colour CSV parse failed, keeping prior colours: %s",
-                    err,
-                )
-        elif routes_failed:
+        else:
             color_status = "fetch-failed"
 
     _LOGGER.info(
         "Loaded Wiener Linien static catalogue: %d stations, %d platforms"
-        " (haltestellen=%s, haltepunkte=%s, linien=%s, fahrwegverlaeufe=%s,"
-        " routes=%s, trip_patterns=%s, colors=%s)",
+        " (linien=%s, fahrwegverlaeufe=%s, routes=%s,"
+        " trip_patterns=%s, colors=%s)",
         len(stations),
         sum(len(s.rbls) for s in stations.values()),
-        "fresh" if halte_text is not None else "304",
-        "fresh" if punkte_text is not None else "304",
-        "fresh" if linien_text is not None else ("failed" if linien_failed else "304"),
-        "fresh" if fahr_text is not None else ("failed" if fahr_failed else "304"),
-        "fresh" if routes_text is not None else ("failed" if routes_failed else "304"),
+        "failed" if linien_failed else "fresh",
+        "failed" if fahr_failed else "fresh",
+        "failed" if routes_failed else "fresh",
         pattern_status,
         color_status,
     )
     return StaticCatalogue(
         stations_by_diva=stations,
         last_fetched=dt_util.utcnow().isoformat(),
-        validators={
-            "haltestellen": halte_validators_new,
-            "haltepunkte": punkte_validators_new,
-            "linien": linien_validators_new,
-            "fahrwegverlaeufe": fahr_validators_new,
-            "routes": routes_validators_new,
-        },
         trip_patterns=trip_patterns,
     )
 
@@ -811,47 +881,94 @@ async def _download_text(
     session: aiohttp.ClientSession,
     url: str,
     timeout: aiohttp.ClientTimeout,
-    validators: CacheValidators,
-) -> tuple[str | None, CacheValidators]:
-    """GET a CSV URL with conditional caching.
-
-    Returns (body_text, updated_validators). body_text is None when the
-    server replies 304 — caller treats that as "no change, reuse prior".
-    The validators object is updated in-place from response headers and
-    returned so callers can persist it.
-    """
+) -> str:
+    """GET a CSV URL and return its body. Raises on any transport error."""
     async with session.get(
         url,
-        headers={**base_request_headers(USER_AGENT), **validators.to_request_headers()},
+        headers=base_request_headers(USER_AGENT),
         timeout=timeout,
     ) as resp:
-        if resp.status == 304:
-            validators.update_from_response(resp)
-            return (None, validators)
         resp.raise_for_status()
-        body = await resp.text()
-        validators.update_from_response(resp)
-        return (body, validators)
+        return await resp.text()
 
 
 async def _download_or_fail_soft(
     session: aiohttp.ClientSession,
     url: str,
     timeout: aiohttp.ClientTimeout,
-    validators: CacheValidators,
-) -> tuple[str | None, CacheValidators, bool]:
+) -> tuple[str | None, bool]:
     """Like `_download_text` but never raises.
 
-    Returns (body_text, validators, failed). On any error, body is None,
-    validators are returned unchanged, and `failed` is True so the caller
-    can distinguish a soft failure from a 304.
+    Returns (body_text, failed). On any error, body is None and `failed` is
+    True so the caller can carry the prior index forward instead.
     """
     try:
-        body, new_validators = await _download_text(session, url, timeout, validators)
+        return (await _download_text(session, url, timeout), False)
     except (TimeoutError, aiohttp.ClientError) as err:
         _LOGGER.warning("Optional static CSV fetch failed (%s): %s", url, err)
-        return (None, validators, True)
-    return (body, new_validators, False)
+        return (None, True)
+
+
+class _ParseResult(NamedTuple):
+    """Everything `_parse_all` produces in one executor hop.
+
+    Errors travel back as values rather than being logged in the worker
+    thread, so `_fetch_and_build` keeps every `_LOGGER` call — and the
+    fail-soft decisions that depend on them — on the event loop.
+    """
+
+    stations: dict[int, Station]
+    trip_patterns: TripPatternIndex | None
+    trip_pattern_error: Exception | None
+    route_colors: tuple[dict[str, str], dict[str, str]] | None
+    route_color_error: Exception | None
+
+
+def _parse_all(
+    halte_text: str,
+    punkte_text: str,
+    linien_text: str | None,
+    fahr_text: str | None,
+    routes_text: str | None,
+) -> _ParseResult:
+    """Run every CSV parse for one refresh. Pure: no `hass`, no logging.
+
+    Called through `hass.async_add_executor_job`, so it must stay free of
+    anything that assumes the event loop. Each optional parse fails soft
+    into its `*_error` field; `_fetch_and_build` decides what that means
+    (carry the prior index, mark the status, emit the warning).
+
+    Route colours are parsed whenever `routes_text` is present, even in the
+    case where the caller will discard them because no trip-pattern index
+    survived. That costs ~1.6 ms inside the executor and keeps this
+    function's branching independent of the caller's fail-soft policy.
+    """
+    stations = _parse_haltestellen(halte_text)
+    _merge_haltepunkte(stations, punkte_text)
+
+    trip_patterns: TripPatternIndex | None = None
+    trip_pattern_error: Exception | None = None
+    if linien_text is not None and fahr_text is not None:
+        try:
+            trip_patterns = _parse_trip_patterns(linien_text, fahr_text, stations)
+        except (KeyError, ValueError) as err:
+            trip_pattern_error = err
+
+    route_colors: tuple[dict[str, str], dict[str, str]] | None = None
+    route_color_error: Exception | None = None
+    if routes_text is not None:
+        try:
+            route_colors = _parse_route_colors(routes_text)
+        except (KeyError, ValueError) as err:
+            route_color_error = err
+
+    return _ParseResult(
+        stations=stations,
+        trip_patterns=trip_patterns,
+        trip_pattern_error=trip_pattern_error,
+        route_colors=route_colors,
+        route_color_error=route_color_error,
+    )
 
 
 def _parse_haltestellen(csv_text: str) -> dict[int, Station]:
@@ -925,7 +1042,17 @@ def _parse_trip_patterns(
             line_id = int(row["LineID"])
         except (KeyError, ValueError, TypeError):
             continue
+        # `REALTIME_LINE_LABELS` overrides `LineText` for the handful of
+        # lines the realtime feed spells differently (LineID 399 is "LB"
+        # here and "WLB" on every departure). Rewriting it at the single
+        # point the label enters the catalogue means the picker, the
+        # changeover chips, the stops-ahead matcher and the saved
+        # selection keys all inherit the feed's spelling — see
+        # `REALTIME_LINE_LABELS` for why LineID is the right key.
         label = (row.get("LineText") or "").strip()
+        alias = REALTIME_LINE_LABELS.get(line_id)
+        if alias is not None and alias[0] == label:
+            label = alias[1]
         if label:
             lines_by_label[label] = line_id
         means = (row.get("MeansOfTransport") or "").strip()
@@ -1005,9 +1132,11 @@ def _parse_trip_patterns(
 # "BB" navy, wins for the Wiener Linien customers this integration
 # primarily serves.
 _AGENCY_WIENER_LINIEN = "04"
-# 6-char uppercase hex matcher. Used to validate `route_color` /
-# `route_text_color` from GTFS routes.txt before passing the value
-# through to the card as `#HHHHHH`.
+# 6-char uppercase hex gate for `route_color` / `route_text_color` before
+# the value reaches the card as `#HHHHHH`. Not `len() == 6`: that accepts
+# garbage like "ZZZZZZ", which renders as the CSS-invalid `#ZZZZZZ` and is
+# silently ignored by the browser. Applied on both the parse path and the
+# store-reload path.
 _HEX6_RE = re.compile(r"^[0-9A-F]{6}$")
 
 
@@ -1034,12 +1163,15 @@ def _parse_route_colors(routes_text: str) -> tuple[dict[str, str], dict[str, str
     bg_agency: dict[str, str] = {}
     reader = csv.DictReader(io.StringIO(routes_text), delimiter=",")
     for row in reader:
-        label = (row.get("route_short_name") or "").strip()
+        raw_label = (row.get("route_short_name") or "").strip()
+        # routes.txt is a third vocabulary — the Badner Bahn is "BB" here,
+        # "WLB" on the realtime feed and "LB" in linien.csv. Fold it onto
+        # the feed's spelling so the palette lands on the label the cards
+        # actually render (see GTFS_LINE_LABEL_ALIASES).
+        label = GTFS_LINE_LABEL_ALIASES.get(raw_label, raw_label)
         color = (row.get("route_color") or "").strip().upper()
-        # Validate as 6-char hex — `len() == 6` alone accepts garbage like
-        # "ZZZZZZ" which the card would render as `#ZZZZZZ` (CSS-invalid,
-        # browser ignores). Falling through to the card's fallback palette
-        # is the right behaviour for a malformed upstream row.
+        # `_HEX6_RE`, not `len() == 6` — see the constant. A malformed row
+        # falls through to the card's fallback palette, which is correct.
         if not label or not _HEX6_RE.match(color):
             continue
         agency = (row.get("agency_id") or "").strip()
@@ -1062,8 +1194,21 @@ def stops_ahead_for_match(
     entry_rbls: Iterable[int],
     towards: str,
     live_direction: str | None = None,
+    line_id: int | None = None,
+    s_bahn_lines_at_diva: Mapping[int, Sequence[str]] | None = None,
 ) -> list[dict[str, Any]] | None:
     """Resolve the next-stops list for a live monitor row.
+
+    `s_bahn_lines_at_diva` (s_bahn_network.py) adds the S-Bahn lines at each
+    stop to its transfer lines, after the U-Bahn.
+
+    `line_id` is the `/monitor` row's `line.lineId`, the same identifier
+    `linien.csv` publishes as `LineID`. When given it resolves the line
+    directly, so a row whose `line.name` the catalogue spells differently
+    (the Badner Bahn is "WLB" live, "LB" in the CSV) still finds its
+    patterns — including from a cache written before `REALTIME_LINE_LABELS`
+    existed. Falls back to the label lookup when absent or unknown, which
+    is what the fixtures and older payloads exercise.
 
     `live_direction` is the `/monitor` row's "H" / "R" string; when given,
     we filter candidate patterns to the matching numeric Direction (Wiener
@@ -1080,8 +1225,10 @@ def stops_ahead_for_match(
     station name, `is_terminus` is True only on the final entry, and
     `lines` (when present) lists the other lines passing through that stop.
     The `diva` key is intentionally omitted to keep the per-stop dict small.
-    The list is hard-capped at MAX_STOPS_AHEAD entries to bound the recorder
-    attribute payload.
+    The list is hard-capped at MAX_STOPS_AHEAD entries to bound the live
+    payload — it rides inside the unrecorded `departures` attribute, so the
+    cost is the push to the frontend and WebSocket subscribers on every
+    state write, not recorder storage.
 
     The only tail truncation is short-turn based: when the live `towards`
     matches a stop on the pattern before its natural terminus, the tail is
@@ -1090,11 +1237,13 @@ def stops_ahead_for_match(
     """
     if catalogue.trip_patterns is None:
         return None
-    line_id = catalogue.trip_patterns.lines_by_label.get(line_label)
-    if line_id is None:
+    resolved_line_id = line_id
+    if resolved_line_id not in catalogue.trip_patterns.patterns_by_line:
+        resolved_line_id = catalogue.trip_patterns.lines_by_label.get(line_label)
+    if resolved_line_id is None:
         return None
 
-    candidates = catalogue.trip_patterns.patterns_by_line.get(line_id)
+    candidates = catalogue.trip_patterns.patterns_by_line.get(resolved_line_id)
     if not candidates:
         return None
 
@@ -1203,9 +1352,9 @@ def stops_ahead_for_match(
     # `is_terminus` flag on the last entry, and an optional `lines` list
     # of OTHER lines (excluding the one we're on) that pass through that
     # stop — sourced from the trip-pattern index's `lines_at_diva`. The
-    # `diva` key is dropped from the attribute on purpose: keeping the
-    # per-stop dict small lets MAX_STOPS_AHEAD-bounded full routes fit
-    # under the 16 KB recorder cap on busy multi-line stops.
+    # `diva` key is dropped from the attribute on purpose: every byte here
+    # is multiplied by MAX_STOPS_AHEAD and again by the departure list on
+    # every state write to the frontend.
     current_label = catalogue.trip_patterns.label_for_line.get(best.line_id)
     lines_at_diva = catalogue.trip_patterns.lines_at_diva
 
@@ -1224,9 +1373,10 @@ def stops_ahead_for_match(
         # Transfer chips: every line at this DIVA except the one we're
         # already on. Skipped silently when the index is empty (e.g. a
         # cache built without stations passed through).
-        transfers = lines_at_diva.get(diva)
-        if transfers:
-            other = [t for t in transfers if t != current_label]
+        transfers = lines_at_diva.get(diva, ())
+        trains = s_bahn_lines_at_diva.get(diva, ()) if s_bahn_lines_at_diva else ()
+        if transfers or trains:
+            other = merge_transfer_lines(transfers, trains, exclude=current_label)
             if other:
                 entry["lines"] = other
         full.append(entry)
@@ -1260,36 +1410,14 @@ def _mot_by_label(
     }
 
 
-def _pick_validators(
-    prior: StaticCatalogue | None, key: str, *, force: bool
-) -> CacheValidators:
-    """Pick the validators to send on the next request for `key`.
-
-    `force=True` (e.g. first-load, or the prior cache lacks the index
-    we need) drops any saved validators so the upstream replies with
-    a full body. Otherwise reuse the saved validators if any.
-    """
-    if force or prior is None:
-        return CacheValidators()
-    return prior.validators.get(key) or CacheValidators()
-
-
 def _station_name_for_rbl(catalogue: StaticCatalogue, rbl: int) -> str | None:
-    """Look up the station name for a given RBL (None if unknown).
-
-    Backed by the catalogue's cached RBL index — O(1) per call after
-    the first hit on any catalogue instance.
-    """
+    """Station name for an RBL, or None. O(1) via the catalogue's index."""
     entry = catalogue.index_by_rbl().get(rbl)
     return entry[1] if entry is not None else None
 
 
 def _diva_for_rbl(catalogue: StaticCatalogue, rbl: int) -> int | None:
-    """Look up the parent DIVA for a given RBL (None if unknown).
-
-    Backed by the catalogue's cached RBL index — O(1) per call after
-    the first hit on any catalogue instance.
-    """
+    """Parent DIVA for an RBL, or None. O(1) via the catalogue's index."""
     entry = catalogue.index_by_rbl().get(rbl)
     return entry[0] if entry is not None else None
 
@@ -1299,10 +1427,6 @@ def _catalogue_to_store(catalogue: StaticCatalogue) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "version": 1,
         "last_fetched": catalogue.last_fetched,
-        "validators": {
-            name: {"etag": v.etag, "last_modified": v.last_modified}
-            for name, v in catalogue.validators.items()
-        },
         "stations": [
             {
                 "diva": s.diva,
@@ -1357,9 +1481,8 @@ def _trip_patterns_from_store(
             int(k): str(v) for k, v in (raw.get("means_by_line") or {}).items()
         }
         # Build label → MoT for the per-stop sort tier — same as the
-        # parse path. Re-sort on read so a cache written under the old
-        # numeric-only sort gets reordered to the new MoT-grouped order
-        # without a network refresh.
+        # parse path. Re-sorted on read so a cache written under an older
+        # sort order still comes out MoT-grouped without a network refresh.
         mot_by_label_load = _mot_by_label(lines_by_label, means_by_line)
         lines_at_diva = {
             int(k): _sort_line_labels(
@@ -1367,10 +1490,8 @@ def _trip_patterns_from_store(
             )
             for k, v in (raw.get("lines_at_diva") or {}).items()
         }
-        # Validate with `_HEX6_RE`, not `len() == 6` — the latter accepts
-        # garbage like "ZZZZZZ" that the card would render as the CSS-invalid
-        # `#ZZZZZZ`. Mirrors the parse path in `_parse_route_colors` so the
-        # store-reload path can't admit colours the parse path would reject.
+        # Same `_HEX6_RE` gate as `_parse_route_colors`, so the store-reload
+        # path can't admit colours the parse path would reject.
         colors_by_line = {
             str(k): str(v).upper()
             for k, v in (raw.get("colors_by_line") or {}).items()
@@ -1413,7 +1534,8 @@ def _catalogue_from_store(data: dict[str, Any]) -> StaticCatalogue:
     """Rebuild a StaticCatalogue from a Store payload.
 
     Older payloads may lack the `trip_patterns` key — default to None
-    and let the next refresh fill it in.
+    and let the next refresh fill it in. A leftover `validators` key is
+    ignored.
     """
     stations: dict[int, Station] = {}
     for row in data["stations"]:
@@ -1426,17 +1548,60 @@ def _catalogue_from_store(data: dict[str, Any]) -> StaticCatalogue:
             latitude=float(row["latitude"]),
             rbls=[int(r) for r in row.get("rbls", [])],
         )
-    validators: dict[str, CacheValidators] = {}
-    for name, raw in (data.get("validators") or {}).items():
-        if not isinstance(raw, dict):
-            continue
-        validators[name] = CacheValidators(
-            etag=raw.get("etag"), last_modified=raw.get("last_modified")
-        )
     trip_patterns = _trip_patterns_from_store(data.get("trip_patterns"))
     return StaticCatalogue(
         stations_by_diva=stations,
         last_fetched=data["last_fetched"],
-        validators=validators,
         trip_patterns=trip_patterns,
     )
+
+
+_S_BAHN_LABEL = re.compile(r"^S\d+$", re.IGNORECASE)
+
+
+def is_s_bahn_label(label: str) -> bool:
+    """Whether a line label is an S-Bahn line ("S" + number)."""
+    return _S_BAHN_LABEL.match(label) is not None
+
+
+def line_colors_for(hass: HomeAssistant, labels: set[str]) -> dict[str, dict[str, str]]:
+    """Return the GTFS palette for `labels`, as `{label: {bg, fg}}`.
+
+    Reads the shared catalogue ref live rather than capturing it at
+    setup, so a background trip-pattern refresh (which also refreshes
+    route colours) is picked up without a restart.
+
+    A label with no GTFS entry is omitted rather than published with an
+    empty colour, and so is any label the catalogue doesn't know. Returns
+    only the S-Bahn entries when the catalogue isn't loaded yet or the
+    routes payload hasn't landed — the cards have their own fallbacks
+    (nightline rule + neutral default), which is also what an omitted label
+    gets. S-Bahn lines ("S" + number) come from `S_BAHN_COLORS`, since the
+    GTFS feed only covers Wiener Linien's own lines.
+    """
+    out: dict[str, dict[str, str]] = {}
+    # S-Bahn first: not in Wiener Linien's GTFS, so it needs no catalogue.
+    for label in labels:
+        if _S_BAHN_LABEL.match(label):
+            out[label] = {
+                "bg": S_BAHN_COLORS.get(label.upper(), S_BAHN_DEFAULT_COLOR),
+                "fg": S_BAHN_TEXT_COLOR,
+            }
+    catalogue = current_catalogue(hass)
+    if catalogue is None:
+        return out
+    index = catalogue.trip_patterns
+    if index is None or not index.colors_by_line:
+        return out
+    for label in labels:
+        if label in out:
+            continue
+        bg = index.colors_by_line.get(label)
+        if not bg:
+            continue
+        entry = {"bg": bg}
+        fg = index.text_colors_by_line.get(label)
+        if fg:
+            entry["fg"] = fg
+        out[label] = entry
+    return out

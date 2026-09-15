@@ -19,9 +19,9 @@ import { classMap } from "lit/directives/class-map.js";
 import { keyed } from "lit/directives/keyed.js";
 import { styleMap } from "lit/directives/style-map.js";
 
-import { FLAP_CARD_VERSION } from "./const.js";
+import { ATTRIBUTION_FALLBACK, FLAP_CARD_VERSION } from "./const.js";
 import { registerWlFonts } from "./font-face.js";
-import { translate } from "./localize/localize.js";
+import { pickerText, translate } from "./localize/localize.js";
 import {
   checkCardVersionWS,
   renderVersionBanner,
@@ -39,8 +39,11 @@ import type {
 } from "./types.js";
 import { LINE_TYPE_METRO } from "./utils/mot.js";
 import { chipPalette } from "./utils/config.js";
-import { filterDepartures } from "./utils/departures.js";
-import { findWienerLinienEntities } from "./utils/entities.js";
+import { filterDepartures, stubDirection } from "./utils/departures.js";
+import {
+  findWienerLinienEntities,
+  mergeLineColorsMaps,
+} from "./utils/entities.js";
 import {
   normaliseFlapConfig,
   type NormalisedFlapConfig,
@@ -142,7 +145,7 @@ function padCountdown(countdown: number | undefined | null): string {
     win.customCards.push({
       type: "wiener-linien-austria-flap-card",
       name: "Wiener Linien Austria — Flap Board",
-      description: "Solari-style split-flap departure board",
+      description: pickerText("picker_flap"),
       preview: true,
       // HA 2026.6 entity-first picker: only suggest this card for
       // sensors owned by this integration. Older HA ignores the key.
@@ -198,7 +201,24 @@ export class WienerLinienAustriaFlapCard extends LitElement {
         "wiener-linien-austria-flap-card: 'entity' must be a string",
       );
     }
-    this._config = normaliseFlapConfig(config);
+    const normalised = normaliseFlapConfig(config);
+    // If the user configured stops but every single one was rejected
+    // (wrong domain, malformed shape), surface that as a Lovelace error
+    // card instead of a silently empty board — an empty board is
+    // indistinguishable from "no departures right now". Per-entry reasons
+    // are already in the console via normaliseStopEntry. Mirrors the
+    // modern card, which has always failed loudly here.
+    const rawCount = Array.isArray(config.entities)
+      ? config.entities.length
+      : typeof config.entity === "string" && config.entity
+        ? 1
+        : 0;
+    if (rawCount > 0 && normalised.entities.length === 0) {
+      throw new Error(
+        "wiener-linien-austria-flap-card: every configured entity was rejected (must start with `sensor.`) — see browser console for per-entry details",
+      );
+    }
+    this._config = normalised;
     // Reset the marching engine on every config swap. Otherwise lowering
     // max_rows leaves orphan flip-state keys for the dropped rows, and a
     // mid-flight march timer keeps ticking toward targets that no longer
@@ -242,15 +262,7 @@ export class WienerLinienAustriaFlapCard extends LitElement {
     const entities = findWienerLinienEntities(hass);
     const first = entities[0];
     if (!first) return {};
-    let direction: "H" | "R" = "H";
-    const deps = hass?.states?.[first]?.attributes?.departures as
-      | DepartureAttr[]
-      | undefined;
-    if (Array.isArray(deps)) {
-      const hasH = deps.some((d) => d.direction === "H");
-      const hasR = deps.some((d) => d.direction === "R");
-      if (!hasH && hasR) direction = "R";
-    }
+    const direction = stubDirection(hass?.states?.[first]?.attributes?.departures);
     return { entity: first, direction };
   }
 
@@ -264,6 +276,21 @@ export class WienerLinienAustriaFlapCard extends LitElement {
       this._versionCheckDone = true;
       void this._checkCardVersion();
     }
+    // Re-arm the march after a detach/reattach (HA rebuilds the dashboard
+    // on load). `disconnectedCallback` cleared the timer, and
+    // `_diffFlipField` only re-arms when a value CHANGES — so reconnecting
+    // with unchanged data would leave the board parked mid-flip on
+    // intermediate glyphs until the next countdown tick happened to move
+    // it. Same hazard the retro card's ticker re-arm exists for.
+    if (this._hasPendingFlips()) this._ensureMarchTimer();
+  }
+
+  /** Any field whose displayed text hasn't reached its target yet — i.e.
+   *  the march is unfinished and needs a timer to carry it. */
+  private _hasPendingFlips(): boolean {
+    return Object.entries(this._target).some(
+      ([key, target]) => this._displayed[key] !== target,
+    );
   }
 
   public override disconnectedCallback(): void {
@@ -426,19 +453,12 @@ export class WienerLinienAustriaFlapCard extends LitElement {
   }
 
   private async _checkCardVersion(): Promise<void> {
-    try {
-      this._versionMismatch = await checkCardVersionWS(
-        this.hass,
-        "wiener_linien_austria/flap_card_version",
-        FLAP_CARD_VERSION,
-      );
-    } catch (err) {
-      // eslint-disable-next-line no-console
-      console.warn(
-        "[wiener-linien-austria-flap-card] version probe failed",
-        err,
-      );
-    }
+    // checkCardVersionWS never rejects, so there is nothing to catch here.
+    this._versionMismatch = await checkCardVersionWS(
+      this.hass,
+      "wiener_linien_austria/flap_card_version",
+      FLAP_CARD_VERSION,
+    );
   }
 
   /** Configured stop entity ids that actually exist in hass.states.
@@ -455,7 +475,6 @@ export class WienerLinienAustriaFlapCard extends LitElement {
     }
     if (out.length === 0 && stops.length > 0 && !this._fallbackWarned) {
       this._fallbackWarned = true;
-      // eslint-disable-next-line no-console
       console.warn(
         `[wiener-linien-austria-flap-card] none of the configured entities exist in hass.states (${stops.map((s) => s.entity).join(", ")})`,
       );
@@ -532,17 +551,22 @@ export class WienerLinienAustriaFlapCard extends LitElement {
     const eids = this._resolveStopEids();
     const rows = this._gatherRows();
     // Card-wide metadata sourced from the FIRST stop: WL-orange band
-    // station name, server_time for the header chips, GTFS palette
-    // for line tiles. line_colors come from the same GTFS feed so a
-    // multi-stop board uses identical colours for shared lines.
+    // station name and server_time for the header chips.
     const firstEid = eids[0] ?? "";
     const firstAttrs = (firstEid
       ? this.hass?.states?.[firstEid]?.attributes ?? {}
       : {}) as WienerLinienAttrs;
     const stationName =
       firstAttrs.stop_name || firstAttrs.friendly_name || "";
-    const lineColors = firstAttrs.line_colors ?? {};
     const serverTime = firstAttrs.server_time;
+    // The palette is the one card-wide value that must NOT come from the
+    // first stop alone. This board renders rows from every configured
+    // stop, and as of v2.0.0 each sensor publishes only the lines it can
+    // be asked to colour — so stop #1's map does not necessarily cover
+    // stop #2's lines, and a line missing from it falls through to the
+    // neutral fallback rather than its GTFS colour. Merge across all of
+    // them.
+    const lineColors = mergeLineColorsMaps(this.hass, eids);
 
     // Per-row platform column. The column is allocated when
     // show_platform is on AND at least one visible row actually has
@@ -564,12 +588,13 @@ export class WienerLinienAustriaFlapCard extends LitElement {
       [`flap--size-${cfg.size}`]: cfg.size !== "regular",
       "flap--has-platform": hasAnyPlatform,
       "flap--light": isLightTheme,
-      // line_pill — flap-card semantics: hide the entire line column.
-      // Mirrors retro's `line_pill` tweak NAME but not its effect
+      // show_line_column — flap-card semantics: the line column is a whole
+      // column of the board, not a per-row pill. v1 called this `line_pill`,
+      // which was retro's key for an unrelated effect
       // (retro renders the line as a pill; flap has no LED voice to
       // pill against, so the equivalent presentation tweak is column
       // suppression — useful on single-line setups).
-      "flap--no-line": cfg.line_pill,
+      "flap--no-line": !cfg.show_line_column,
       // housing — when off, drop the cabinet surround so the panel
       // sits flush. Default on, so existing dashboards keep the
       // cabinet look.
@@ -606,7 +631,7 @@ export class WienerLinienAustriaFlapCard extends LitElement {
     const attribution = cfg.hide_attribution
       ? ""
       : (typeof firstAttrs.attribution === "string" && firstAttrs.attribution) ||
-        "Datenquelle: Wiener Linien (data.wien.gv.at), CC BY 4.0";
+        ATTRIBUTION_FALLBACK;
 
     return html`
       <ha-card style="padding:0;overflow:hidden;">
@@ -629,7 +654,7 @@ export class WienerLinienAustriaFlapCard extends LitElement {
               hasAnyPlatform,
               platformLabel,
               cfg.show_accessibility,
-              cfg.line_pill,
+              !cfg.show_line_column,
               lineColors,
             )}
             ${attribution
@@ -833,7 +858,10 @@ export class WienerLinienAustriaFlapCard extends LitElement {
         : isAtPlatform
           ? this._t("at_platform")
           : this._t("countdown_minutes", { n: String(cd) });
-    const rowLabel = [rawLine, towards, cdLabel].filter(Boolean).join(" — ");
+    const timetableLabel = d.timetable ? this._t("timetable_title") : "";
+    const rowLabel = [rawLine, towards, cdLabel, timetableLabel]
+      .filter(Boolean)
+      .join(" — ");
 
     // Resolve the line palette through chipPalette so each character
     // tile in the line column is painted with the official WL line
@@ -904,6 +932,15 @@ export class WienerLinienAustriaFlapCard extends LitElement {
         </div>
         ${platformCell}
         <div class="flap-cell flap-cell--cd" aria-hidden="true">
+          ${d.timetable
+            ? // Before the digits: the cell packs to the end, so the
+              // countdown stays aligned with the live rows above and below.
+              this._renderPictogramTile(
+                "mdi:calendar-clock",
+                this._t("timetable_title"),
+                "plain",
+              )
+            : nothing}
           <span class="flap-cd-tiles">${cdContent}</span>
           ${cfg.show_min_unit && cd !== null
             ? html`<span class="flap-cd-unit">${this._t("unit_min")}</span>`
@@ -1009,12 +1046,17 @@ export class WienerLinienAustriaFlapCard extends LitElement {
   private _renderPictogramTile(
     icon: string,
     ariaLabel: string,
+    face: "a11y" | "plain" = "a11y",
   ): TemplateResult {
     // Single ha-icon overlay (NOT one per half) — ha-icon refuses to
     // clip itself to its parent half, so two halves = two visible
     // icons. Seam draws on top via z-index 2 vs the overlay's 1.
+    // The blue face is reserved for the accessibility sign; any other
+    // pictogram takes the cream face so it can't be read as one.
     return html`<span
-      class="flap-tile flap-tile--pictogram"
+      class="flap-tile flap-tile--pictogram${face === "plain"
+        ? " flap-tile--pictogram-plain"
+        : ""}"
       aria-label=${ariaLabel}
     >
       <span class="flap-tile__half flap-tile__half--top"></span>
@@ -1249,7 +1291,7 @@ export class WienerLinienAustriaFlapCard extends LitElement {
     .flap-board--has-platform {
       grid-template-columns: auto 1fr auto auto;
     }
-    /* line_pill (flap-card semantics: hide line column) — the line
+    /* show_line_column off — the line
        cell + line colheader span are skipped in the template, so the
        grid loses its first auto track and shifts dest into column 1.
        Subgrids on .flap-colheader / .flap-row pick up the new track
@@ -1523,6 +1565,34 @@ export class WienerLinienAustriaFlapCard extends LitElement {
     }
     .flap-tile--pictogram .flap-tile__seam::after {
       background: rgba(255, 255, 255, 0.28);
+    }
+    /* Cream face for non-accessibility pictograms (the timetable clock
+       on planned S-Bahn rows): same material as the text tiles. */
+    .flap-tile--pictogram.flap-tile--pictogram-plain .flap-tile__half--top {
+      background: linear-gradient(
+        180deg,
+        var(--flap-cream-hi) 0%,
+        var(--flap-cream) 100%
+      );
+    }
+    .flap-tile--pictogram.flap-tile--pictogram-plain .flap-tile__half--bottom {
+      background: linear-gradient(
+        180deg,
+        var(--flap-cream) 0%,
+        var(--flap-cream-lo) 100%
+      );
+    }
+    .flap-tile--pictogram.flap-tile--pictogram-plain .flap-tile__seam {
+      background: var(--flap-seam);
+    }
+    .flap-tile--pictogram-plain .flap-tile__pictogram-overlay,
+    .flap-tile--pictogram-plain .flap-tile__pictogram {
+      color: var(--flap-ink);
+    }
+    /* The cd cell aligns its tiles on the baseline; a pictogram tile has
+       no text to give it one. */
+    .flap-cell--cd > .flap-tile--pictogram {
+      align-self: center;
     }
     .flap-tile__pictogram-overlay {
       position: absolute;

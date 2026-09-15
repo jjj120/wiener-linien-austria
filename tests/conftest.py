@@ -9,18 +9,32 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from freezegun.api import FrozenDateTimeFactory
 from homeassistant.const import CONF_SCAN_INTERVAL
+from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 from pytest_homeassistant_custom_component.syrupy import HomeAssistantSnapshotExtension
 from syrupy.assertion import SnapshotAssertion
 
 from custom_components.wiener_linien_austria import rate_limit
 from custom_components.wiener_linien_austria.const import (
+    CONF_ACTIVE_DAYS,
+    CONF_DESTINATION_DIVA,
+    CONF_DESTINATION_NAME,
     CONF_DIVA,
+    CONF_ENTRY_TYPE,
+    CONF_EXCLUDED_MEANS,
     CONF_LINES,
+    CONF_MAX_CHANGES,
+    CONF_MIN_TRANSFER_MINUTES,
+    CONF_ORIGIN_DIVA,
+    CONF_ORIGIN_NAME,
     CONF_RBLS,
+    CONF_ROUTE_TYPE,
     CONF_STOP_NAME,
+    CONF_WALK_SPEED,
     DOMAIN,
+    ENTRY_TYPE_ROUTE,
 )
 from custom_components.wiener_linien_austria.static import (
     StaticCatalogue,
@@ -54,8 +68,27 @@ def _collapse_domain_cooldown(request: pytest.FixtureRequest) -> Generator[None]
     if "real_domain_cooldown" in request.keywords:
         yield
         return
-    with patch.object(rate_limit, "DOMAIN_COOLDOWN_SECONDS", 0):
+    with (
+        patch.object(rate_limit, "DOMAIN_COOLDOWN_SECONDS", 0),
+        patch.object(rate_limit, "ROUTING_COOLDOWN_SECONDS", 0),
+    ):
         yield
+
+
+LIVE_FETCH = "custom_components.wiener_linien_austria.live.async_fetch_monitor_body"
+
+
+@pytest.fixture(autouse=True)
+def live_fetch() -> Generator[AsyncMock]:
+    """The live-times `/monitor` call, answering with no departures.
+
+    Autouse so no route or on-demand test can reach the real endpoint. Tests
+    about live times set `return_value` (see `_monitor_body` in test_live.py).
+    """
+    with patch(
+        LIVE_FETCH, new_callable=AsyncMock, return_value={"data": {"monitors": []}}
+    ) as mock:
+        yield mock
 
 
 def make_response_cm(resp: Any) -> MagicMock:
@@ -157,6 +190,74 @@ def make_v1_entry(
         options=options,
         title=title,
     )
+
+
+# ---------------------------------------------------------------------------
+# Routing: shared by test_route.py and test_adhoc.py
+# ---------------------------------------------------------------------------
+
+ROUTE_FETCH = (
+    "custom_components.wiener_linien_austria.route_coordinator.async_fetch_trip_body"
+)
+# 07:50 in Vienna on the capture day — every captured trip is still ahead.
+ROUTE_NOW = "2026-09-14 05:50:00+00:00"
+
+ROUTE_DATA: dict[str, Any] = {
+    CONF_ENTRY_TYPE: ENTRY_TYPE_ROUTE,
+    CONF_ORIGIN_DIVA: 60201468,
+    CONF_ORIGIN_NAME: "Westbahnhof",
+    CONF_DESTINATION_DIVA: 60201040,
+    CONF_DESTINATION_NAME: "Praterstern",
+    CONF_ROUTE_TYPE: "leasttime",
+    CONF_MAX_CHANGES: "any",
+    CONF_WALK_SPEED: "normal",
+    CONF_MIN_TRANSFER_MINUTES: 2,
+    CONF_EXCLUDED_MEANS: [],
+    CONF_ACTIVE_DAYS: [],
+    CONF_SCAN_INTERVAL: 300,
+}
+
+
+def routing_body(name: str = "routing_westbahnhof_praterstern.json") -> dict[str, Any]:
+    """A captured trip-planner response."""
+    result: dict[str, Any] = json.loads((FIXTURES / name).read_text())
+    return result
+
+
+def route_entry(**overrides: Any) -> MockConfigEntry:
+    """A Westbahnhof → Praterstern route entry, not yet added to hass."""
+    return MockConfigEntry(
+        domain=DOMAIN,
+        data={**ROUTE_DATA, **overrides},
+        title="Westbahnhof → Praterstern",
+        version=2,
+        unique_id="route_60201468_60201040",
+    )
+
+
+async def async_setup_entry_and_wait(
+    hass: HomeAssistant, entry: MockConfigEntry
+) -> None:
+    """Add `entry` to hass, set it up and let it settle."""
+    entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+@pytest.fixture
+def frozen(freezer: FrozenDateTimeFactory) -> FrozenDateTimeFactory:
+    """The clock at `ROUTE_NOW`."""
+    freezer.move_to(ROUTE_NOW)
+    return freezer
+
+
+@pytest.fixture
+def fetch() -> Generator[AsyncMock]:
+    """The trip-planner request, answering with the captured response."""
+    with patch(
+        ROUTE_FETCH, new_callable=AsyncMock, return_value=routing_body()
+    ) as mock:
+        yield mock
 
 
 def _load_fixture(name: str) -> dict:
@@ -282,12 +383,17 @@ def auto_enable_custom_integrations(enable_custom_integrations):
 def mock_aiohttp_session():
     """Stub the aiohttp session to prevent pycares DNS thread leaks.
 
-    The batch group owns the /monitor session; the coordinator no longer
-    creates one. Patch the batch binding so a group timer firing during a
+    The batch group owns the /monitor session; the coordinator doesn't
+    create one. Patch the batch binding so a group timer firing during a
     time-advancing test can't reach the real network.
     """
-    with patch(
-        "custom_components.wiener_linien_austria.batch.async_get_clientsession",
+    with (
+        patch(
+            "custom_components.wiener_linien_austria.batch.async_get_clientsession",
+        ),
+        patch(
+            "custom_components.wiener_linien_austria.route_coordinator.async_get_clientsession",
+        ),
     ):
         yield
 
@@ -331,6 +437,36 @@ def mock_static_catalogue():
         ),
     ):
         yield catalogue
+
+
+@pytest.fixture(autouse=True)
+def mock_s_bahn_picker_probe():
+    """Stub the line picker's S-Bahn probe so config-flow tests stay offline.
+
+    Returns no S-Bahn lines, which is what most stops have. Tests that
+    exercise the S-Bahn options set `return_value` on the yielded mock.
+    """
+    with patch(
+        "custom_components.wiener_linien_austria.config_flow.async_probe_picker_rows",
+        new_callable=AsyncMock,
+        return_value=[],
+    ) as probe:
+        yield probe
+
+
+@pytest.fixture(autouse=True)
+def mock_s_bahn_network_update():
+    """Keep entry setup from starting the S-Bahn network crawl.
+
+    Setup schedules it as a background task that would queue seven routing
+    requests behind the 15 s cooldown. Only the binding `__init__` calls is
+    patched, so test_s_bahn_network.py still reaches the real scheduler
+    through its own module.
+    """
+    with patch(
+        "custom_components.wiener_linien_austria.async_schedule_network_update",
+    ) as schedule:
+        yield schedule
 
 
 @pytest.fixture

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Any
 
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
@@ -10,7 +11,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfTime
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .alerts import get_alerts_for, line_names_from_keys
@@ -29,7 +30,17 @@ from .coordinator import (
     WienerLinienAustriaCoordinator,
     WienerLinienConfigEntry,
 )
-from .static import CATALOGUE_KEY, StaticCatalogue
+from .route_coordinator import (
+    WienerLinienRouteConfigEntry,
+    WienerLinienRouteCoordinator,
+    route_device_info,
+    route_trip_attributes,
+)
+from .static import (
+    canonical_line_key,
+    current_catalogue,
+    line_colors_for,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -38,11 +49,14 @@ PARALLEL_UPDATES = 0
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: WienerLinienConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    entry: WienerLinienConfigEntry | WienerLinienRouteConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Set up the single stop sensor for this entry."""
+    """Set up the stop sensor, or the route sensor for a route entry."""
     coordinator = entry.runtime_data
+    if isinstance(coordinator, WienerLinienRouteCoordinator):
+        async_add_entities([WienerLinienRouteSensor(coordinator, entry)])
+        return
     async_add_entities([WienerLinienStopSensor(coordinator, entry)])
 
 
@@ -118,11 +132,8 @@ class WienerLinienStopSensor(
         hass = self.hass if self.hass is not None else self.coordinator.hass
         domain_data = hass.data.get(DOMAIN, {})
         current_alerts_seq = int(domain_data.get(ALERTS_SEQ_KEY, 0))
-        cached = self.coordinator._attrs_cache
-        if (
-            cached is not None
-            and self.coordinator._attrs_cache_alerts_seq == current_alerts_seq
-        ):
+        cached = self.coordinator.cached_attrs(current_alerts_seq)
+        if cached is not None:
             return cached
 
         config = {**self._entry.data, **self._entry.options}
@@ -143,7 +154,7 @@ class WienerLinienStopSensor(
             next_by_line.setdefault(dep.line, dep.countdown)
 
         # Match domain-wide alert caches against this entry's lines + RBLs.
-        # Lines derived from CONF_LINES ("U1|H|Leopoldau") — the user's own
+        # Lines derived from CONF_LINES ("U1|H") — the user's own
         # selection, stable even when no departures are flowing right now.
         # Fall back to live departures for the "all lines" case.
         selected_line_keys = config.get(CONF_LINES) or []
@@ -152,27 +163,15 @@ class WienerLinienStopSensor(
             line_names = {d.line for d in departures if d.line}
         rbls = {int(r) for r in config.get(CONF_RBLS) or []}
 
-        # `hass` was resolved above the cache check — same reasoning:
-        # prefer `self.hass` (set by HA during `async_added_to_hass`)
-        # and fall back to the coordinator's ref so tests that read
-        # `extra_state_attributes` without routing through HA core
-        # still resolve.
         traffic, elevator = get_alerts_for(hass, line_names, rbls)
 
         # Cap the list at MAX_DEPARTURES_IN_ATTRS so busy multi-line stops
-        # (e.g. Stephansplatz tracking U1/U3/U4 ≈ ~40 entries) stay under HA's
-        # 16 KB recorder attribute cap. The card respects its own
+        # (e.g. Stephansplatz tracking U1/U3/U4 ≈ ~40 entries) don't pay to
+        # publish rows nothing renders. NOT a recorder budget — `departures`
+        # is in `_unrecorded_attributes` above; see MAX_DEPARTURES_IN_ATTRS in
+        # const.py for what the cap actually bounds. The card respects its own
         # max_departures setting (≤ 20) so nothing the UI shows is lost.
         capped = [d.to_dict() for d in departures[:MAX_DEPARTURES_IN_ATTRS]]
-
-        # GTFS-derived per-line palette. Published unscoped (every line in
-        # the Wiener Linien catalogue, not just lines at this stop) because
-        # the card's stops_ahead trail can render chips for transfer lines
-        # at OTHER stops — scoping here would leave those chips colourless.
-        # Total size is ~3 KB regardless of stop, well under the recorder's
-        # 16 KB attribute cap, and the data is identical across sensors so
-        # the recorder dedupes it via the state-diff path.
-        line_colors = self._line_colors()
 
         # Static-catalogue line list for THIS stop — every line that
         # serves the DIVA per the Wiener Linien schedule, regardless of
@@ -181,16 +180,66 @@ class WienerLinienStopSensor(
         # catalogue/trip-pattern index isn't loaded yet.
         lines_at_stop = self._lines_at_stop(diva)
 
+        # GTFS-derived per-line palette, scoped to the lines this entity
+        # can actually be asked to colour.
+        #
+        # Not the whole Wiener Linien catalogue. Measured 2026-09-09 against
+        # the live feed: that is 7,242 bytes for 179 lines with bg+fg —
+        # ~26% of a 27.4 KB payload at a hub stop, and byte-identical on
+        # every entry, so a five-stop install pushed ~36 KB of the same
+        # palette on every state write.
+        #
+        # The union below is the contract, and every term is load-bearing
+        # — a label the cards render but this set omits gets the neutral
+        # fallback instead of its GTFS colour, which is silent and looks
+        # like a design choice:
+        #   * lines_at_stop  — departure chips, and the editor's colour
+        #                      picker (collectLinesInSelection reads it)
+        #   * live departures — belt-and-braces; normally a subset of the
+        #                      above, but the live feed is not bound by
+        #                      the weekly catalogue
+        #   * stops_ahead lines — transfer chips for lines at OTHER stops
+        #   * traffic/elevator related_lines — notice badges, which name
+        #                      lines that need not serve this stop at all
+        #                      (plus a short notice's inferred_lines, the
+        #                      badges it gets when it names none itself)
+        #
+        # Cross-entity reuse is the other half. The flap board and the
+        # modern card's notice badges render lines from EVERY configured
+        # stop off one palette, merged across entities
+        # (`mergeLineColorsMaps`). Don't narrow this set without checking
+        # that helper's callers.
+        needed_labels: set[str] = set(lines_at_stop)
+        needed_labels.update(d.line for d in departures if d.line)
+        for row in capped:
+            for stop in row.get("stops_ahead") or []:
+                needed_labels.update(stop.get("lines") or ())
+        for traffic_alert in traffic:
+            needed_labels.update(traffic_alert.related_lines)
+            needed_labels.update(traffic_alert.inferred_lines)
+        for elevator_alert in elevator:
+            needed_labels.update(elevator_alert.related_lines)
+        line_colors = self._line_colors(needed_labels)
+
         # User-tracked subset of `lines_at_stop` — the lines selected in
         # the integration's config flow (`CONF_LINES` is a list of
-        # `{line}|{direction}` keys). All three card editors prefer this
+        # `{line}|{direction}` keys). The three departure-board card editors prefer this
         # filtered list so the per-stop pickers don't surface lines the
         # user has explicitly opted out of, while still including ones
         # that aren't currently driving (nightlines during the day,
         # day-only lines after midnight). Empty when nothing's tracked,
         # in which case the editors fall through to `lines_at_stop`.
+        # Canonicalised on the way out: a selection saved as "LB|H" is
+        # published as "WLB|H", the spelling the live departures carry.
+        # The cards filter `departure.line` against this list, so a legacy
+        # key published verbatim silently empties the board (issue #110).
+        # Stored entry data is deliberately left alone — every reader
+        # canonicalises, so there is nothing to migrate and nothing to
+        # break if a user downgrades.
         tracked_keys = [
-            str(k) for k in (selected_line_keys or []) if isinstance(k, str) and k
+            canonical_line_key(k)
+            for k in (selected_line_keys or [])
+            if isinstance(k, str) and k
         ]
         tracked_lines = sorted({k.split("|", 1)[0] for k in tracked_keys})
 
@@ -219,8 +268,7 @@ class WienerLinienStopSensor(
             "traffic_info": [t.to_dict() for t in traffic],
             "elevator_info": [e.to_dict() for e in elevator],
         }
-        self.coordinator._attrs_cache = attrs
-        self.coordinator._attrs_cache_alerts_seq = current_alerts_seq
+        self.coordinator.store_attrs(attrs, current_alerts_seq)
         return attrs
 
     def _lines_at_stop(self, diva: int) -> list[str]:
@@ -230,9 +278,8 @@ class WienerLinienStopSensor(
         loaded yet — callers (the card editor) fall through to the
         live-derived list in that case so behaviour degrades gracefully.
         """
-        domain_data = self.coordinator.hass.data.get(DOMAIN, {})
-        catalogue = domain_data.get(CATALOGUE_KEY)
-        if not isinstance(catalogue, StaticCatalogue):
+        catalogue = current_catalogue(self.coordinator.hass)
+        if catalogue is None:
             return []
         index = catalogue.trip_patterns
         if index is None:
@@ -240,30 +287,19 @@ class WienerLinienStopSensor(
         labels = index.lines_at_diva.get(diva)
         return list(labels) if labels else []
 
-    def _line_colors(self) -> dict[str, dict[str, str]]:
-        """Return the full GTFS palette as `{label: {bg, fg}}`.
+    def _line_colors(self, labels: set[str]) -> dict[str, dict[str, str]]:
+        """Return the GTFS palette for `labels`; see `line_colors_for`.
 
-        Reads the shared catalogue ref live so a background trip-pattern
-        refresh (which also refreshes route colours) is picked up on the
-        very next sensor read. Returns `{}` when the catalogue isn't
-        loaded yet or the routes payload hasn't landed — the card has its
-        own fallbacks (nightline rule + neutral default).
+        Refreshed colours land on the next coordinator tick, not the next
+        sensor read: this runs inside `extra_state_attributes`, whose
+        result is memoised on the coordinator, and
+        `static.async_set_cached_catalogue` publishes a new catalogue
+        without invalidating that cache. Bounded by the entry's scan
+        interval — harmless for data that changes on a weeks-to-months
+        cadence. See the call site for which labels have to be in
+        `labels` and why.
         """
-        domain_data = self.coordinator.hass.data.get(DOMAIN, {})
-        catalogue = domain_data.get(CATALOGUE_KEY)
-        if not isinstance(catalogue, StaticCatalogue):
-            return {}
-        index = catalogue.trip_patterns
-        if index is None or not index.colors_by_line:
-            return {}
-        out: dict[str, dict[str, str]] = {}
-        for label, bg in index.colors_by_line.items():
-            entry = {"bg": bg}
-            fg = index.text_colors_by_line.get(label)
-            if fg:
-                entry["fg"] = fg
-            out[label] = entry
-        return out
+        return line_colors_for(self.coordinator.hass, labels)
 
     @property
     def available(self) -> bool:
@@ -289,19 +325,87 @@ class WienerLinienStopSensor(
         `available=True` and the state keeps reporting the cached
         last-known value.
 
-        Mitigation: surface staleness through the `server_time`
-        attribute (templates that care about freshness can compare
-        it to `now()` and decide). For users who need
-        availability-based automations to fire on actual outages,
-        document the workaround: a template binary_sensor that
-        flips on `(now() - server_time) > threshold`.
+        Mitigation, shipped in v2.0.0: `binary_sensor.<stop>_stale`
+        (device_class `problem`) carries the signal this override
+        suppresses — it goes on when `last_update_success` flips False
+        or when `server_time` ages past three polling intervals. Gate
+        outage automations on that entity, not on this one's
+        availability. `server_time` remains on this entity for
+        templates that want to judge freshness themselves.
 
-        DO NOT lift this pattern naively to other integrations
-        without the same UX-vs-contract trade-off being made
-        deliberately. Especially not for entities driving
-        automations more than dashboards. The cleaner alternative is a
-        separate `binary_sensor.<...>_stale` entity — see the
-        portfolio-liftables reference, item 13 (maintainer note; the
-        file is not in this repo).
+        Don't lift this override to a sibling integration without
+        taking the binary_sensor with it. On its own it is a silent
+        removal of the availability contract; the pair is the design.
         """
         return self.coordinator.data is not None
+
+
+class WienerLinienRouteSensor(
+    CoordinatorEntity[WienerLinienRouteCoordinator], SensorEntity
+):
+    """One sensor per route. State = departure of the best connection.
+
+    A timestamp rather than a countdown: Home Assistant renders it as
+    "in 4 minutes" on its own, automations can compare it directly, and
+    the state only changes when the plan does instead of every minute.
+    Uses the stock `available` contract — unlike the stop sensor there is
+    no cached board worth keeping on screen through an outage, because a
+    stale connection plan is actively misleading.
+    """
+
+    _attr_has_entity_name = True
+    _attr_translation_key = "route"
+    _attr_attribution = ATTRIBUTION
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _unrecorded_attributes = frozenset(
+        {"trips", "line_colors", "traffic_info", "elevator_info", "last_connection"}
+    )
+
+    def __init__(
+        self,
+        coordinator: WienerLinienRouteCoordinator,
+        entry: ConfigEntry,
+    ) -> None:
+        """Initialise the sensor — unique_id format is frozen."""
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_route"
+        self._attr_device_info = route_device_info(entry)
+
+    @property
+    def native_value(self) -> datetime | None:
+        """Departure of the best connection, or None when there is none."""
+        data = self.coordinator.data
+        if data is None or not data.trips:
+            return None
+        return data.trips[0].departure
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """The ranked connections, their line colours and matching alerts."""
+        coordinator = self.coordinator
+        data = coordinator.data
+        trips = data.trips if data is not None else []
+        best = trips[0] if trips else None
+        return {
+            "origin": coordinator.origin_name,
+            "destination": coordinator.destination_name,
+            "active": data.active if data is not None else False,
+            "active_window": coordinator.active_window,
+            "fetched_at": (
+                data.fetched_at.isoformat()
+                if data is not None and data.fetched_at is not None
+                else None
+            ),
+            "arrival": best.arrival.isoformat() if best and best.arrival else None,
+            "duration_minutes": best.duration_minutes if best else None,
+            "interchanges": best.interchanges if best else None,
+            "risk": best.risk if best else None,
+            "min_transfer_minutes": coordinator.options.min_transfer_minutes,
+            "step_free": coordinator.options.step_free,
+            "last_connection": (
+                data.last_connection.to_dict()
+                if data is not None and data.last_connection is not None
+                else None
+            ),
+            **route_trip_attributes(coordinator.hass, trips),
+        }

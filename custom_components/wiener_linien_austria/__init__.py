@@ -15,48 +15,69 @@ from homeassistant.components.websocket_api.decorators import (
     async_response,
     websocket_command,
 )
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED, Platform
-from homeassistant.core import CoreState, Event, HomeAssistant
+from homeassistant.core import CoreState, Event, HomeAssistant, callback
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.event import async_track_time_interval
 
+from .adhoc import ADHOC_PLANNER_KEY, AdhocPlanner
 from .alerts import async_refresh_alerts
 from .batch import MonitorBatchGroup
 from .card_registration import JSModuleRegistration
 from .const import (
-    ALERT_CACHE_VALIDATORS_KEY,
     ALERTS_REFRESH_SECONDS,
     ALERTS_REFRESH_UNSUB_KEY,
     BATCH_REGISTRY_KEY,
     CARD_VERSION,
+    CONF_ENTRY_TYPE,
     CONF_LINES,
     DOMAIN,
     DOMAIN_LAST_CALL_KEY,
     ELEVATOR_INFO_KEY,
     ENTRY_COUNT_KEY,
+    ENTRY_TYPE_ROUTE,
     FLAP_CARD_VERSION,
     RESOURCES_REGISTERED_KEY,
     RETRO_CARD_VERSION,
+    ROUTE_CARD_VERSION,
+    S_BAHN_NETWORK_CHECK_INTERVAL,
     STATIC_CACHE_REFRESH_HOURS,
     TRAFFIC_INFO_KEY,
 )
 from .coordinator import WienerLinienAustriaCoordinator, WienerLinienConfigEntry
-from .rate_limit import LOCK_KEY, LOCK_LOOP_KEY
+from .live import LIVE_BOARD_KEY
+from .rate_limit import (
+    LOCK_KEY,
+    LOCK_LOOP_KEY,
+    ROUTING_LAST_CALL_KEY,
+    ROUTING_LOCK_KEY,
+    ROUTING_LOCK_LOOP_KEY,
+)
+from .route_coordinator import WienerLinienRouteCoordinator, route_device_info
+from .s_bahn_network import (
+    S_BAHN_NETWORK_KEY,
+    S_BAHN_NETWORK_TASK_KEY,
+    async_schedule_network_update,
+)
+from .services import async_setup_services
 from .static import (
     BACKGROUND_REFRESH_TASK_KEY,
     CATALOGUE_KEY,
     async_refresh_catalogue,
     async_set_cached_catalogue,
 )
+from .websocket import STOPS_CACHE_KEY, async_setup_websocket
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 _LOGGER = logging.getLogger(__name__)
-PLATFORMS: list[Platform] = [Platform.SENSOR]
+PLATFORMS: list[Platform] = [Platform.BINARY_SENSOR, Platform.SENSOR]
 
 STATIC_REFRESH_UNSUB_KEY = "static_refresh_unsub"
+S_BAHN_NETWORK_UNSUB_KEY = "s_bahn_network_unsub"
 
 
 @websocket_command({vol.Required("type"): "wiener_linien_austria/card_version"})
@@ -92,23 +113,40 @@ async def _websocket_flap_card_version(
     connection.send_result(msg["id"], {"version": FLAP_CARD_VERSION})
 
 
+@websocket_command({vol.Required("type"): "wiener_linien_austria/route_card_version"})
+@async_response
+async def _websocket_route_card_version(
+    hass: HomeAssistant,
+    connection: ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Return the route card version so its frontend can detect mismatches."""
+    connection.send_result(msg["id"], {"version": ROUTE_CARD_VERSION})
+
+
 async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
     """Set up the Wiener Linien Austria component.
 
-    Process-scoped concerns only: register the WebSocket card-version
-    commands and the Lovelace JS resource. Domain-wide *timers* are
-    booted from the FIRST `async_setup_entry` and torn down by the LAST
-    `async_unload_entry` — see `_ensure_domain_timers` and the unload
-    cleanup tuple. Putting the timers here would leak across the
-    "remove last entry, add a new one" flow because `async_setup` only
+    Process-scoped concerns only: register the WebSocket commands (the
+    four card-version probes plus the route card's `stops` / `plan`, see
+    websocket.py), the `plan_trip` action and the Lovelace JS resources.
+    Domain-wide *timers* are booted from the FIRST `async_setup_entry` and
+    torn down by the LAST `async_unload_entry` — see `_ensure_domain_timers`
+    and the unload cleanup tuple. Putting the timers here would leak across
+    the "remove last entry, add a new one" flow because `async_setup` only
     runs once per HA process.
     """
     # WS commands are process-scoped — HA core has no deregister API.
     # `async_setup` only runs once per HA process, so duplicate
-    # registration can't happen.
+    # registration can't happen. The flip side: the handlers outlive a
+    # removed integration, which is why the ad-hoc ones answer
+    # `not_loaded` unless an entry is loaded.
     async_register_command(hass, _websocket_card_version)
     async_register_command(hass, _websocket_retro_card_version)
     async_register_command(hass, _websocket_flap_card_version)
+    async_register_command(hass, _websocket_route_card_version)
+    async_setup_websocket(hass)
+    async_setup_services(hass)
 
     registration = JSModuleRegistration(hass)
 
@@ -169,10 +207,10 @@ def _ensure_domain_timers(hass: HomeAssistant) -> None:
                 _LOGGER.warning("Static-catalogue periodic refresh failed: %s", err)
                 return
             if refreshed is not None:
-                # Surface the new catalogue to future config-flow / entry-load
-                # callers. Already-running coordinators keep their captured
-                # ref — accepted because trip patterns and stops change on a
-                # weeks-to-months cadence.
+                # Publish the new catalogue. Coordinators, sensors and live.py
+                # read the shared ref on every use, so they pick it up without
+                # a reload; only a stop's coordinates, captured at setup, wait
+                # for the next entry reload.
                 async_set_cached_catalogue(hass, refreshed)
 
         domain_data[STATIC_REFRESH_UNSUB_KEY] = async_track_time_interval(
@@ -206,6 +244,31 @@ def _ensure_domain_timers(hass: HomeAssistant) -> None:
             timedelta(seconds=ALERTS_REFRESH_SECONDS),
             cancel_on_shutdown=True,
         )
+
+
+def _ensure_s_bahn_network(hass: HomeAssistant) -> None:
+    """Start the S-Bahn network's daily staleness check, and one check now.
+
+    Board entries only: the network feeds the stops-ahead transfer chips,
+    and a route-only install has no stops-ahead trails. Idempotent like
+    `_ensure_domain_timers`; the check itself fetches nothing while every
+    hub sample is fresh, so a restart costs a Store read.
+    """
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    if S_BAHN_NETWORK_UNSUB_KEY in domain_data:
+        return
+
+    @callback
+    def _periodic_check(_now: Any) -> None:
+        async_schedule_network_update(hass)
+
+    domain_data[S_BAHN_NETWORK_UNSUB_KEY] = async_track_time_interval(
+        hass,
+        _periodic_check,
+        S_BAHN_NETWORK_CHECK_INTERVAL,
+        cancel_on_shutdown=True,
+    )
+    async_schedule_network_update(hass)
 
 
 def _register_in_batch(
@@ -259,6 +322,8 @@ async def async_setup_entry(
     hass: HomeAssistant, entry: WienerLinienConfigEntry
 ) -> bool:
     """Set up Wiener Linien Austria from a config entry."""
+    if entry.data.get(CONF_ENTRY_TYPE) == ENTRY_TYPE_ROUTE:
+        return await _async_setup_route_entry(hass, entry)
     coordinator = WienerLinienAustriaCoordinator(hass, entry)
     # Register into the shared batch group for this entry's scan interval
     # BEFORE the first refresh, so the combined /monitor request already
@@ -285,6 +350,7 @@ async def async_setup_entry(
     # recreates them, which `async_setup` (process-scoped, runs once)
     # cannot do.
     _ensure_domain_timers(hass)
+    _ensure_s_bahn_network(hass)
 
     entry.runtime_data = coordinator
 
@@ -326,6 +392,40 @@ async def async_setup_entry(
     return True
 
 
+async def _async_setup_route_entry(
+    hass: HomeAssistant, entry: ConfigEntry[Any]
+) -> bool:
+    """Set up an A→B route entry.
+
+    Mirrors the stop path's bookkeeping — entry count, domain timers, the
+    up-front device, rollback on a platform failure — minus the batch
+    group: a route polls the routing backend on its own coordinator timer.
+    Its live times come from `/monitor` through live.py, riding in the
+    boards' batch request where one exists. It still counts as a live
+    entry, so the alerts refresh keeps running for a route-only install and
+    route legs can be matched against disruptions.
+    """
+    coordinator = WienerLinienRouteCoordinator(hass, entry)
+    await coordinator.async_config_entry_first_refresh()
+
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    domain_data[ENTRY_COUNT_KEY] = domain_data.get(ENTRY_COUNT_KEY, 0) + 1
+    _ensure_domain_timers(hass)
+
+    entry.runtime_data = coordinator
+    dr.async_get(hass).async_get_or_create(
+        config_entry_id=entry.entry_id, **route_device_info(entry)
+    )
+    try:
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    except Exception:
+        await _rollback_setup_failure(hass, coordinator)
+        raise
+    entry.async_on_unload(coordinator.async_shutdown)
+    entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
+    return True
+
+
 def _teardown_domain_state(domain_data: dict[str, Any]) -> None:
     """Tear down every domain-wide resource that should die with the LAST entry.
 
@@ -334,22 +434,18 @@ def _teardown_domain_state(domain_data: dict[str, Any]) -> None:
     path) so a new cleanup key only has to land in one place.
 
     Cancels timer subscriptions, in-flight bg tasks, and pops every
-    cache + validator key.
+    cache and cooldown key.
 
-    Note on the modern HA alternative: per-resource cleanup
-    (one timer, one listener, one lock) is better expressed via
-    `entry.async_on_unload(callable)` — HA core invokes those
-    callbacks on BOTH successful unload AND setup-failure, so no
-    explicit rollback is needed for entry-scoped resources.
-    `_teardown_domain_state` exists because the cleanup here is
-    DOMAIN-WIDE (refcount-driven, shared across entries) and
-    `async_on_unload` is per-entry — which is the wrong granularity
-    for "fire when the LAST entry removes." Keep this pattern for
-    domain-wide state; for new per-entry cleanup, prefer
-    `entry.async_on_unload`. See the portfolio-liftables reference,
-    item 6 (maintainer note; the file is not in this repo).
+    For NEW per-entry cleanup prefer `entry.async_on_unload`, which HA
+    invokes on both unload and setup-failure. This exists because the
+    cleanup here is domain-wide and refcount-driven — the wrong
+    granularity for a per-entry callback.
     """
-    for unsub_key in (ALERTS_REFRESH_UNSUB_KEY, STATIC_REFRESH_UNSUB_KEY):
+    for unsub_key in (
+        ALERTS_REFRESH_UNSUB_KEY,
+        STATIC_REFRESH_UNSUB_KEY,
+        S_BAHN_NETWORK_UNSUB_KEY,
+    ):
         unsub = domain_data.pop(unsub_key, None)
         if callable(unsub):
             unsub()
@@ -357,9 +453,10 @@ def _teardown_domain_state(domain_data: dict[str, Any]) -> None:
     # complete after teardown and re-poison the catalogue ref. The
     # task's done-callback also self-clears the slot; popping here is
     # belt-and-braces.
-    bg_task = domain_data.pop(BACKGROUND_REFRESH_TASK_KEY, None)
-    if isinstance(bg_task, asyncio.Task) and not bg_task.done():
-        bg_task.cancel()
+    for task_key in (BACKGROUND_REFRESH_TASK_KEY, S_BAHN_NETWORK_TASK_KEY):
+        bg_task = domain_data.pop(task_key, None)
+        if isinstance(bg_task, asyncio.Task) and not bg_task.done():
+            bg_task.cancel()
     # Stop every remaining batch-group timer. Groups normally self-stop as
     # their last member deregisters, but the LAST entry's `async_on_unload`
     # dereg fires AFTER this teardown runs (HA runs on_unload callbacks after
@@ -368,26 +465,40 @@ def _teardown_domain_state(domain_data: dict[str, Any]) -> None:
     if isinstance(registry, dict):
         for group in registry.values():
             group.stop()
-    # Drop the rest of the domain-wide state — caches and validators
-    # are stale by definition once no entry is around to consume them.
+    # Drop the rest of the domain-wide state — the caches are stale by
+    # definition once no entry is around to consume them.
     # RESOURCES_REGISTERED_KEY pops too so the next first-entry boot
     # re-runs JSModuleRegistration.async_register — covers the user's
     # delete-last-entry + async_remove_entry-tore-down-resources case.
     for stale_key in (
         TRAFFIC_INFO_KEY,
         ELEVATOR_INFO_KEY,
-        ALERT_CACHE_VALIDATORS_KEY,
         DOMAIN_LAST_CALL_KEY,
         LOCK_KEY,
         LOCK_LOOP_KEY,
+        ROUTING_LAST_CALL_KEY,
+        ROUTING_LOCK_KEY,
+        ROUTING_LOCK_LOOP_KEY,
         CATALOGUE_KEY,
+        S_BAHN_NETWORK_KEY,
+        # Holds a reference to the catalogue it was built from.
+        STOPS_CACHE_KEY,
+        # Live rows and leases name the stops routes and dashboards use.
+        LIVE_BOARD_KEY,
         RESOURCES_REGISTERED_KEY,
     ):
         domain_data.pop(stale_key, None)
+    # The ad-hoc planner stays, so removing and re-adding the integration
+    # doesn't refill its request budget. Its plans go: a stop pair picked on
+    # a dashboard shouldn't outlive the integration in memory.
+    planner = domain_data.get(ADHOC_PLANNER_KEY)
+    if isinstance(planner, AdhocPlanner):
+        planner.async_clear_cache()
 
 
 async def _rollback_setup_failure(
-    hass: HomeAssistant, coordinator: WienerLinienAustriaCoordinator
+    hass: HomeAssistant,
+    coordinator: WienerLinienAustriaCoordinator | WienerLinienRouteCoordinator,
 ) -> None:
     """Decrement counter + tear down domain state on a partial-setup failure.
 
@@ -413,8 +524,8 @@ async def _async_reload_entry(
     """Reload the config entry when its options or data change.
 
     Fires for options-flow updates AND for reconfigure-flow data changes
-    (the config flow now calls ``async_update_and_abort`` without a
-    built-in reload), making this the single reload owner.
+    (the config flow calls ``async_update_and_abort``, which doesn't
+    reload), making this the single reload owner.
     """
     await hass.config_entries.async_reload(entry.entry_id)
 
@@ -451,7 +562,7 @@ async def async_remove_entry(
 ) -> None:
     """Drop the Lovelace resources when the LAST config entry is removed.
 
-    All three card resources are registered once globally per integration,
+    All four card resources are registered once globally per integration,
     so reloading or removing a single entry must not remove them. Only when
     no other entries of this domain remain do we unregister.
     """

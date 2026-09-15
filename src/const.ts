@@ -1,14 +1,20 @@
-// CARD_VERSION / RETRO_CARD_VERSION / FLAP_CARD_VERSION must match
+// CARD_VERSION / RETRO_CARD_VERSION / FLAP_CARD_VERSION / ROUTE_CARD_VERSION must match
 // the corresponding constants in
 // custom_components/wiener_linien_austria/const.py byte-for-byte.
 // If they drift, the WebSocket version check sees a mismatch, shows
 // a reload banner, the reload re-serves the same JS, and the banner
 // loops forever.
-export const CARD_VERSION = "1.8.1";
-export const RETRO_CARD_VERSION = "1.8.1";
-export const FLAP_CARD_VERSION = "1.8.1";
+export const CARD_VERSION = "2.0.0";
+export const RETRO_CARD_VERSION = "2.0.0";
+export const FLAP_CARD_VERSION = "2.0.0";
+export const ROUTE_CARD_VERSION = "2.0.0";
 
 export const DOMAIN = "wiener_linien_austria";
+
+// CC-BY credit shown in a card footer until the sensor reports its own
+// `attribution` attribute (fresh card, sensor not up yet). Same text as
+// ATTRIBUTION in const.py.
+export const ATTRIBUTION_FALLBACK = "Datenquelle: Wiener Linien (data.wien.gv.at), CC BY 4.0";
 
 // Per-line palette is sourced from the integration's GTFS-backed
 // `line_colors` sensor attribute (Wiener Linien `routes.txt`); a

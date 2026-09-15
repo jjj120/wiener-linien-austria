@@ -11,6 +11,7 @@ from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import CONF_SCAN_INTERVAL
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import UpdateFailed
+from homeassistant.util import dt as dt_util
 
 from custom_components.wiener_linien_austria.batch import BatchResult
 from custom_components.wiener_linien_austria.const import (
@@ -21,6 +22,8 @@ from custom_components.wiener_linien_austria.const import (
 from custom_components.wiener_linien_austria.coordinator import (
     MonitorData,
     WienerLinienAustriaCoordinator,
+    _normalise_lines,
+    _parse_iso,
     _parse_monitor_body,
 )
 
@@ -283,6 +286,172 @@ def _u1_h_body() -> dict:
     }
 
 
+def _wlb_catalogue():
+    """A catalogue that spells LineID 399 the way linien.csv does ("LB").
+
+    That is the pre-refresh shape a running install has on the first tick
+    after upgrading: the cached index still carries the CSV label while
+    the feed is already answering "WLB".
+    """
+    from custom_components.wiener_linien_austria.static import (
+        StaticCatalogue,
+        Station,
+        TripPattern,
+        TripPatternIndex,
+    )
+
+    stations = {
+        62000010: Station(62000010, "Eichenstraße", "Wien", 16.34, 48.18, [4900]),
+        62000011: Station(62000011, "Wien Oper", "Wien", 16.37, 48.20, [4901]),
+    }
+    index = TripPatternIndex(
+        patterns_by_line={
+            399: [
+                TripPattern(line_id=399, pattern_id=1, direction=1, stops=(4900, 4901))
+            ]
+        },
+        lines_by_label={"LB": 399},
+        means_by_line={399: "ptTramWLB"},
+    )
+    return StaticCatalogue(
+        stations_by_diva=stations, last_fetched="t", trip_patterns=index
+    )
+
+
+def _wlb_body() -> dict:
+    """One Badner Bahn departure, spelled the way /monitor spells it."""
+    return {
+        "data": {
+            "monitors": [
+                {
+                    "lines": [
+                        {
+                            "name": "WLB",
+                            "lineId": 399,
+                            "towards": "Wien Oper",
+                            "direction": "H",
+                            "type": "ptTramWLB",
+                            "barrierFree": True,
+                            "realtimeSupported": True,
+                            "trafficjam": False,
+                            "departures": {
+                                "departure": [
+                                    {
+                                        "departureTime": {"countdown": 4},
+                                        "vehicle": {"towards": "Wien Oper"},
+                                    },
+                                ]
+                            },
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+
+
+def test_parse_monitor_body_keeps_legacy_line_label_selection() -> None:
+    """A selection saved as "LB|H" still matches the feed's "WLB" rows.
+
+    Issue #110: the picker offered the static catalogue's label, the feed
+    answers with a different one, and the (line, direction) compare dropped
+    every Badner Bahn departure without logging anything.
+    """
+    result = _parse_monitor_body(
+        _wlb_body(),
+        {"LB|H"},
+        None,
+        catalogue=_wlb_catalogue(),
+        entry_rbls=[4900],
+    )
+    assert [d.line for d in result.departures] == ["WLB"]
+
+
+def test_normalise_lines_canonicalises_legacy_selection() -> None:
+    """Saved keys are folded onto the realtime spelling before matching.
+
+    This is the path a user is on once the catalogue has refreshed: it now
+    spells LineID 399 "WLB" like the feed does, so the lineId join has
+    nothing left to widen and the saved "LB|H" has to be translated on the
+    way in instead.
+    """
+    from custom_components.wiener_linien_austria.static import (
+        StaticCatalogue,
+        Station,
+        TripPattern,
+        TripPatternIndex,
+    )
+
+    refreshed = StaticCatalogue(
+        stations_by_diva={
+            62000010: Station(62000010, "Eichenstraße", "Wien", 16.34, 48.18, [4900]),
+            62000011: Station(62000011, "Wien Oper", "Wien", 16.37, 48.20, [4901]),
+        },
+        last_fetched="t",
+        trip_patterns=TripPatternIndex(
+            patterns_by_line={
+                399: [
+                    TripPattern(
+                        line_id=399, pattern_id=1, direction=1, stops=(4900, 4901)
+                    )
+                ]
+            },
+            lines_by_label={"WLB": 399},
+            means_by_line={399: "ptTramWLB"},
+        ),
+    )
+    assert _normalise_lines(["LB|H"]) == {"WLB|H"}
+    result = _parse_monitor_body(
+        _wlb_body(),
+        _normalise_lines(["LB|H"]),
+        None,
+        catalogue=refreshed,
+        entry_rbls=[4900],
+    )
+    assert [d.line for d in result.departures] == ["WLB"]
+
+
+def test_parse_monitor_body_matches_realtime_line_label_selection() -> None:
+    """The realtime spelling matches directly, with or without a catalogue."""
+    for catalogue in (_wlb_catalogue(), None):
+        result = _parse_monitor_body(
+            _wlb_body(), {"WLB|H"}, None, catalogue=catalogue, entry_rbls=[4900]
+        )
+        assert [d.line for d in result.departures] == ["WLB"]
+
+
+def test_parse_monitor_body_line_id_alias_respects_direction() -> None:
+    """The lineId join widens the label, never the direction."""
+    result = _parse_monitor_body(
+        _wlb_body(),
+        {"LB|R"},
+        None,
+        catalogue=_wlb_catalogue(),
+        entry_rbls=[4900],
+    )
+    assert result.departures == []
+
+
+def test_parse_monitor_body_line_id_alias_does_not_leak_other_lines() -> None:
+    """An unrelated line is not pulled in just because a lineId is present."""
+    body = _wlb_body()
+    body["data"]["monitors"][0]["lines"][0].update({"name": "6", "lineId": 106})
+    result = _parse_monitor_body(
+        body, {"LB|H"}, None, catalogue=_wlb_catalogue(), entry_rbls=[4900]
+    )
+    assert result.departures == []
+
+
+def test_parse_monitor_body_stops_ahead_uses_line_id_for_aliased_line() -> None:
+    """stops_ahead resolves off lineId when the label lookup would miss."""
+    result = _parse_monitor_body(
+        _wlb_body(), None, None, catalogue=_wlb_catalogue(), entry_rbls=[4900]
+    )
+    sa = result.departures[0].stops_ahead
+    assert sa is not None
+    assert [s["name"] for s in sa] == ["Wien Oper"]
+
+
 def test_parse_monitor_body_enriches_with_stops_ahead() -> None:
     """When catalogue + entry_rbls are passed, departures get stops_ahead."""
     catalogue = _u1_catalogue_for_coord()
@@ -326,9 +495,9 @@ def test_parse_monitor_body_failsoft_on_match_exception() -> None:
     def _boom(*_args, **_kwargs):
         raise RuntimeError("synthetic matcher failure")
 
-    # Patch the symbol bound in coordinator (where it's actually called)
-    # — the import is now at module level, so the historical
-    # `static.stops_ahead_for_match` patch path no longer intercepts.
+    # Patch the symbol bound in coordinator (where it's actually called):
+    # the module-level import means patching `static.stops_ahead_for_match`
+    # would not intercept.
     with patch(
         "custom_components.wiener_linien_austria.coordinator.stops_ahead_for_match",
         side_effect=_boom,
@@ -434,9 +603,8 @@ async def test_async_setup_no_coords_when_catalogue_load_fails(
     coordinator = WienerLinienAustriaCoordinator(hass, entry)
 
     # Patch the binding `coordinator` resolves at runtime, not the source
-    # in `static`. After hoist (no more lazy import), patching the source
-    # module no longer affects `coordinator.async_get_catalogue` — it was
-    # bound at import time.
+    # in `static`: `coordinator.async_get_catalogue` is bound at import
+    # time, so patching the source module wouldn't affect it.
     with patch(
         "custom_components.wiener_linien_austria.coordinator.async_get_catalogue",
         new_callable=AsyncMock,
@@ -481,8 +649,8 @@ def test_parse_monitor_body_handles_bus_fixture(tram_fixture) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Batch delegation — the coordinator no longer fetches; it parses its slice
-# out of a shared batch result. The HTTP / 304 / backoff / rate-limit / domain
+# Batch delegation — the coordinator doesn't fetch; it parses its slice
+# out of a shared batch result. The HTTP / backoff / rate-limit / domain
 # cooldown behaviour lives in test_batch.py against MonitorBatchGroup.
 # ---------------------------------------------------------------------------
 
@@ -663,7 +831,7 @@ async def test_apply_upstream_meta_records_server_time_and_code(
 async def test_scan_interval_reflects_config(hass: HomeAssistant) -> None:
     """The configured scan interval is exposed and drives batch grouping.
 
-    The coordinator no longer self-polls (update_interval is None); the shared
+    The coordinator doesn't self-poll (update_interval is None); the shared
     batch group is keyed on this value instead.
     """
     entry = _make_entry({CONF_SCAN_INTERVAL: 120})
@@ -671,6 +839,17 @@ async def test_scan_interval_reflects_config(hass: HomeAssistant) -> None:
     coordinator = WienerLinienAustriaCoordinator(hass, entry)
     assert coordinator.scan_interval == timedelta(seconds=120)
     assert coordinator.update_interval is None
+
+
+@pytest.mark.parametrize(("stored", "effective"), [(5, 30), (99999, 600)])
+async def test_scan_interval_is_clamped_to_its_range(
+    hass: HomeAssistant, stored: int, effective: int
+) -> None:
+    """A hand-edited entry can't put its batch group below the 30 s floor."""
+    entry = _make_entry({CONF_SCAN_INTERVAL: stored})
+    entry.add_to_hass(hass)
+    coordinator = WienerLinienAustriaCoordinator(hass, entry)
+    assert coordinator.scan_interval == timedelta(seconds=effective)
 
 
 # ---------------------------------------------------------------------------
@@ -847,3 +1026,104 @@ def test_stale_warning_latches_until_recovery(
     with caplog.at_level("WARNING"):
         coordinator._note_stale_departures(stale)
     assert sum("Dropped 2 stale" in r.message for r in caplog.records) == 1
+
+
+# ---------------------------------------------------------------------------
+# Naive/aware timestamp handling (`_parse_iso`)
+# ---------------------------------------------------------------------------
+
+
+def _naive_body(planned: str, countdown: int = 5) -> dict:
+    """One departure whose `timePlanned` is whatever the caller passes."""
+    return {
+        "data": {
+            "monitors": [
+                {
+                    "lines": [
+                        {
+                            "name": "U1",
+                            "towards": "Leopoldau",
+                            "direction": "H",
+                            "type": "ptMetro",
+                            "departures": {
+                                "departure": [
+                                    {
+                                        "departureTime": {
+                                            "timePlanned": planned,
+                                            "countdown": countdown,
+                                        },
+                                        "vehicle": {"towards": "Leopoldau"},
+                                    }
+                                ]
+                            },
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+
+
+def test_parse_iso_stamps_the_default_zone_on_a_naive_timestamp() -> None:
+    """A `timePlanned` with no offset is read as HA-local, not as UTC.
+
+    Forcing UTC would shift a Vienna timestamp by one or two hours, which
+    against `STALE_DEPARTURE_MAX_AGE` starts dropping real departures —
+    a worse failure than the `TypeError` it would be fixing.
+    """
+    parsed = _parse_iso("2026-08-29T19:11:47.000")
+
+    assert parsed is not None
+    assert parsed.tzinfo is not None
+    assert parsed.utcoffset() == dt_util.get_default_time_zone().utcoffset(
+        parsed.replace(tzinfo=None)
+    )
+
+
+def test_parse_iso_leaves_an_offset_aware_timestamp_alone() -> None:
+    """The shape the feed actually sends is passed through untouched."""
+    parsed = _parse_iso("2026-08-29T19:11:47.000+0200")
+
+    assert parsed is not None
+    assert parsed.utcoffset() == timedelta(hours=2)
+
+
+def test_naive_planned_time_with_aware_server_time_does_not_raise() -> None:
+    """One naive field is enough to reach the comparison — it must not raise.
+
+    Mixed naive/aware is the crash the zone stamp exists to prevent: the
+    record here is fresh, so it has to survive the stale filter rather
+    than take the whole parse down with a `TypeError`.
+    """
+    body = _naive_body(dt_util.now().replace(tzinfo=None).isoformat())
+
+    result = _parse_monitor_body(body, None, STALE_FIXTURE_SERVER_TIME)
+
+    assert result.stale_dropped == 0
+    assert len(result.departures) == 1
+
+
+def test_naive_planned_time_with_no_server_time_does_not_raise() -> None:
+    """The likelier trigger: `serverTime` absent, so the cutoff is UTC-aware.
+
+    `_parse_monitor_body` falls back to `dt_util.utcnow()` whenever
+    `serverTime` is missing or unparseable, so a single naive
+    `timePlanned` reaches an aware cutoff with nothing else needed.
+    """
+    body = _naive_body(dt_util.now().replace(tzinfo=None).isoformat())
+
+    result = _parse_monitor_body(body, None, None)
+
+    assert result.stale_dropped == 0
+    assert len(result.departures) == 1
+
+
+def test_naive_planned_time_is_still_dropped_when_genuinely_stale() -> None:
+    """Stamping a zone must not smuggle ghost records past the filter."""
+    frozen = (dt_util.now() - timedelta(days=2)).replace(tzinfo=None)
+    body = _naive_body(frozen.isoformat())
+
+    result = _parse_monitor_body(body, None, None)
+
+    assert result.stale_dropped == 1
+    assert result.departures == []
