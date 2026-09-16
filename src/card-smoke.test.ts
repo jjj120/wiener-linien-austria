@@ -421,3 +421,124 @@ describe("tab-scoped alert banner", () => {
     expect(text).toContain("U1: Gleisschaden");
   });
 });
+
+// ---------------------------------------------------------------------------
+// stops_ahead_modes — which transfer categories get a chip in the trail.
+// ---------------------------------------------------------------------------
+
+/** One stop with a transfer from each of the five categories. `43` is the
+ *  tram, `13A` the city bus, `N38` the NightLine. */
+function trailHass(): HomeAssistant {
+  return {
+    language: "de",
+    themes: { darkMode: false },
+    localize: (key: string) => key,
+    states: {
+      [ENTITY]: {
+        entity_id: ENTITY,
+        state: "1",
+        attributes: {
+          stop_name: "Westbahnhof",
+          diva: 60200959,
+          server_time: "2026-09-09T16:35:58.000+0200",
+          line_colors: {},
+          lines_at_stop: ["U3"],
+          departures: [
+            {
+              line: "U3",
+              direction: "H",
+              towards: "Simmering",
+              type: "ptMetro",
+              countdown: 3,
+              time_planned: "2026-09-09T16:38:00.000+0200",
+              time_real: "2026-09-09T16:38:30.000+0200",
+              realtime: true,
+              stops_ahead: [
+                { name: "Zieglergasse", lines: ["U3", "S45", "43", "13A", "N38"] },
+              ],
+            },
+          ],
+          traffic_info: [],
+          elevator_info: [],
+        },
+      },
+    },
+  } as unknown as HomeAssistant;
+}
+
+/** Inline chip labels plus the count behind the `+N` toggle.
+ *
+ *  The two are read together because only the inline half is deterministic:
+ *  U- and S-chips always sit inline, while a NightLine moves between inline
+ *  and the `+N` panel depending on Vienna's clock (`_isNightlineHour`), and
+ *  the `+N` panel's own chips only enter the DOM once expanded. Their SUM is
+ *  stable at any hour, which is what makes `total` safe to assert on. */
+function trailChips(el: CardElement): { inline: string[]; total: number } {
+  const root = shadow(el);
+  const inline = [...root.querySelectorAll(".stops-ahead-line-chip")].map(
+    (n) => n.textContent?.trim() ?? "",
+  );
+  const counter = root.querySelector(".stops-ahead-other-count");
+  const other = counter ? Number(counter.textContent?.replace("+", "") ?? "0") : 0;
+  return { inline, total: inline.length + other };
+}
+
+async function mountTrail(modes?: unknown): Promise<CardElement> {
+  return mount(MODERN, trailHass(), {
+    type: `custom:${MODERN}`,
+    entities: [{ entity: ENTITY }],
+    ...(modes === undefined ? {} : { stops_ahead_modes: modes }),
+  });
+}
+
+describe("stops_ahead_modes", () => {
+  it("chips every category when the key is absent", async () => {
+    const { inline, total } = trailChips(await mountTrail());
+    expect(total).toBe(5);
+    expect(inline).toContain("U3");
+    expect(inline).toContain("S45");
+  });
+
+  it("drops the U-chips when metro is off", async () => {
+    const { inline, total } = trailChips(
+      await mountTrail(["sbahn", "tram", "bus", "night"]),
+    );
+    expect(total).toBe(4);
+    expect(inline).not.toContain("U3");
+    expect(inline).toContain("S45");
+  });
+
+  // The inline U/S chips and the `+N` panel are two halves of one list, so a
+  // filter applied to only the panel would leave these visible — the bug this
+  // pins is "metro off, U-chip still there".
+  it("drops the S-chips when sbahn is off", async () => {
+    const { inline, total } = trailChips(
+      await mountTrail(["metro", "tram", "bus", "night"]),
+    );
+    expect(total).toBe(4);
+    expect(inline).not.toContain("S45");
+    expect(inline).toContain("U3");
+  });
+
+  it("keeps only the rail categories when tram, bus and night are off", async () => {
+    const { inline, total } = trailChips(await mountTrail(["metro", "sbahn"]));
+    expect(total).toBe(2);
+    expect(inline.sort()).toEqual(["S45", "U3"]);
+  });
+
+  it("renders no chip and no +N toggle when every category is off", async () => {
+    const el = await mountTrail([]);
+    expect(trailChips(el)).toEqual({ inline: [], total: 0 });
+    expect(shadow(el).querySelector(".stops-ahead-other-toggle")).toBeNull();
+  });
+
+  // The stop itself is not a transfer — hiding every category must not empty
+  // the trail, only strip it of chips.
+  it("still renders the stop name when every category is off", async () => {
+    const el = await mountTrail([]);
+    const names = [...shadow(el).querySelectorAll(".stops-ahead-name")].map(
+      (n) => n.textContent?.trim(),
+    );
+    expect(names).toContain("Zieglergasse");
+  });
+});

@@ -48,3 +48,50 @@ export function lineTypeIcon(type: string | undefined): string | null {
 export function headerIconForType(type: string | undefined): string {
   return lineTypeIcon(type) ?? "mdi:bus-stop";
 }
+
+// ---------------------------------------------------------------------------
+// Transfer modes — the vehicle categories the stops-ahead trail can chip.
+// ---------------------------------------------------------------------------
+//
+// These are derived from the LINE LABEL, not from a `type` field, because
+// `stops_ahead[].lines` publishes bare labels: the trip-pattern index knows
+// which lines call at a stop, not what each of them is. Extending the label
+// heuristic the trail already applies (`/^[US]\d/` for the inline chips,
+// `/^N\d/` for nightlines) keeps one rule rather than two that can disagree.
+
+/** The five categories a user can show or hide, in signage order. */
+export const TRANSFER_MODES = ["metro", "sbahn", "tram", "bus", "night"] as const;
+
+export type TransferMode = (typeof TRANSFER_MODES)[number];
+
+/** MDI glyph per category — the editor's chips and nothing else so far. */
+export const TRANSFER_MODE_ICONS: Readonly<Record<TransferMode, string>> = {
+  metro: "mdi:subway-variant",
+  sbahn: "mdi:train",
+  tram: "mdi:tram",
+  bus: "mdi:bus",
+  night: "mdi:weather-night",
+};
+
+/**
+ * Classify a Wiener Linien line label into one of `TRANSFER_MODES`.
+ *
+ * Order matters. `N25` is a bus by vehicle but a NightLine by category, and
+ * the user toggles it as one — so the N-prefix is tested before the bus
+ * shape it would otherwise match. After the three prefixed families, a
+ * digits-then-letter label (`13A`, `25B`) is a city bus; everything left is
+ * a tram, which correctly catches the numeric lines (`1`, `71`), the letter
+ * lines (`D`, `O`) and the Badner Bahn (`WLB`).
+ *
+ * An unrecognised future label lands in `tram` rather than being dropped:
+ * a category toggle the user left ON should not silently swallow a line the
+ * heuristic has not met yet.
+ */
+export function transferModeOf(label: string): TransferMode {
+  const upper = label.toUpperCase();
+  if (/^N\d/.test(upper)) return "night";
+  if (/^U\d/.test(upper)) return "metro";
+  if (/^S\d/.test(upper)) return "sbahn";
+  if (/^\d+[A-Z]$/.test(upper)) return "bus";
+  return "tram";
+}

@@ -1,4 +1,5 @@
 import { NIGHTLINE_BG, NIGHTLINE_FG } from "../const.js";
+import { TRANSFER_MODES, type TransferMode } from "./mot.js";
 import { accentTextColor } from "./color.js";
 import { CARD_DEFAULTS } from "./card-vocabulary.js";
 import { canonicalLineLabel } from "./line-labels.js";
@@ -311,6 +312,11 @@ export interface NormalisedModernConfigValidated {
   show_hero_metric: boolean;
   show_departures: boolean;
   show_stops_ahead: boolean;
+  /** Which vehicle categories get a transfer chip in the stops-ahead trail.
+   *  Order is irrelevant; membership is the whole meaning. An EMPTY array is
+   *  a real state ("chip nothing"), distinct from the key being absent
+   *  ("chip everything") — see the normaliser. */
+  stops_ahead_modes: TransferMode[];
   show_qr_button: boolean;
   hide_header: boolean;
   hide_attribution: boolean;
@@ -355,13 +361,17 @@ const MODERN_VALIDATED_KEYS: ReadonlySet<string> = new Set([
   "show_hero_metric",
   "show_departures",
   "show_stops_ahead",
+  "stops_ahead_modes",
   "show_qr_button",
   "hide_header",
   "hide_attribution",
   "layout",
 ]);
 
-const MODERN_DEFAULTS: Omit<NormalisedModernConfigValidated, "entities" | "line_colors" | "type"> = {
+const MODERN_DEFAULTS: Omit<
+  NormalisedModernConfigValidated,
+  "entities" | "line_colors" | "type" | "stops_ahead_modes"
+> = {
   max_departures: 6,
   show_accessibility: false,
   accessibility_only: false,
@@ -380,6 +390,23 @@ const MODERN_DEFAULTS: Omit<NormalisedModernConfigValidated, "entities" | "line_
   hide_attribution: false,
   layout: "stacked",
 };
+
+// Absence and emptiness mean different things here, which is why this is not
+// `cleanStringList`. A config written before the feature existed has no key at
+// all and must keep chipping every mode; a user who switched all five chips off
+// saves `[]` and must get exactly that. Anything that is not an array — a null,
+// a YAML string, a number — reads as "not configured" and takes the default.
+function normaliseTransferModes(raw: unknown): TransferMode[] {
+  if (!Array.isArray(raw)) return [...TRANSFER_MODES];
+  const valid = new Set<string>(TRANSFER_MODES);
+  const seen = new Set<TransferMode>();
+  for (const v of raw) {
+    if (typeof v === "string" && valid.has(v)) seen.add(v as TransferMode);
+  }
+  // Re-derived from TRANSFER_MODES rather than from insertion order, so the
+  // saved YAML reads in signage order however the user clicked the chips.
+  return TRANSFER_MODES.filter((m) => seen.has(m));
+}
 
 // Accepts a raw, untyped config record: callers pass either a fresh
 // `WienerLinienCardConfig` (card `setConfig`) or an already-normalised
@@ -461,6 +488,7 @@ export function normaliseModernConfig(raw: Record<string, unknown>): NormalisedM
     show_hero_metric: asBool(raw.show_hero_metric, MODERN_DEFAULTS.show_hero_metric),
     show_departures: asBool(raw.show_departures, MODERN_DEFAULTS.show_departures),
     show_stops_ahead: asBool(raw.show_stops_ahead, MODERN_DEFAULTS.show_stops_ahead),
+    stops_ahead_modes: normaliseTransferModes(raw.stops_ahead_modes),
     show_qr_button: asBool(raw.show_qr_button, MODERN_DEFAULTS.show_qr_button),
     hide_header: asBool(raw.hide_header, MODERN_DEFAULTS.hide_header),
     hide_attribution: asBool(raw.hide_attribution, MODERN_DEFAULTS.hide_attribution),

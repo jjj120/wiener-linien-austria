@@ -255,3 +255,96 @@ describe("tablist ARIA matches the DOM it produces", () => {
     expect(labels[0]?.textContent?.trim()).toBe("Haltestellen");
   });
 });
+
+describe("transfer-mode chips (modern, Anzeige tab)", () => {
+  /** Mount the modern editor and switch to the Anzeige tab, where the chips
+   *  live. The tab is private state, so the test drives it the way a user
+   *  does — by clicking. The Anzeige tab's other sections are `ha-form`,
+   *  which is undefined here and renders nothing, so every `.wl-chip` found
+   *  afterwards is a transfer-mode chip. */
+  async function onDisplayTab(
+    config: Record<string, unknown> = {},
+  ): Promise<EditorElement> {
+    const el = await mount(MODERN, BUSY_STOP, {
+      type: "custom:wiener-linien-austria-card",
+      entities: [{ entity: ENTITY }],
+      ...config,
+    });
+    const tabs = shadow(el).querySelectorAll<HTMLButtonElement>('[role="tab"]');
+    tabs[1]?.click();
+    await el.updateComplete;
+    return el;
+  }
+
+  const modeChips = (el: EditorElement): HTMLButtonElement[] => [
+    ...shadow(el).querySelectorAll<HTMLButtonElement>(".wl-chip"),
+  ];
+
+  it("renders one chip per mode, all pressed by default", async () => {
+    const chips = modeChips(await onDisplayTab());
+    expect(chips).toHaveLength(5);
+    expect(chips.map((c) => c.getAttribute("aria-pressed"))).toEqual(
+      Array(5).fill("true"),
+    );
+  });
+
+  it("reflects a saved subset rather than always showing all five as on", async () => {
+    const chips = modeChips(await onDisplayTab({ stops_ahead_modes: ["metro", "bus"] }));
+    // Chips render in TRANSFER_MODES order: metro, sbahn, tram, bus, night.
+    expect(chips.map((c) => c.getAttribute("aria-pressed"))).toEqual([
+      "true",
+      "false",
+      "false",
+      "true",
+      "false",
+    ]);
+  });
+
+  it("clicking a chip writes the remaining modes back", async () => {
+    const el = await onDisplayTab();
+    let config: Record<string, unknown> | undefined;
+    el.addEventListener("config-changed", (ev) => {
+      config = (ev as CustomEvent<{ config: Record<string, unknown> }>).detail.config;
+    });
+
+    modeChips(el)[0]?.click();
+    await el.updateComplete;
+
+    expect(config?.["stops_ahead_modes"]).toEqual(["sbahn", "tram", "bus", "night"]);
+  });
+
+  // Empty must survive the round-trip: the normaliser reads a missing key as
+  // "every mode", so a control that dropped the key here would make "hide
+  // everything" unsaveable.
+  it("switching the last chip off saves an empty array, not an absent key", async () => {
+    const el = await onDisplayTab({ stops_ahead_modes: ["metro"] });
+    let config: Record<string, unknown> | undefined;
+    el.addEventListener("config-changed", (ev) => {
+      config = (ev as CustomEvent<{ config: Record<string, unknown> }>).detail.config;
+    });
+
+    modeChips(el)[0]?.click();
+    await el.updateComplete;
+
+    expect(config?.["stops_ahead_modes"]).toEqual([]);
+  });
+
+  it("goes inert — but stays focusable — with the stops trail switched off", async () => {
+    const el = await onDisplayTab({ show_stops_ahead: false });
+    const chips = modeChips(el);
+    expect(chips.map((c) => c.getAttribute("aria-disabled"))).toEqual(
+      Array(5).fill("true"),
+    );
+    // aria-disabled rather than the `disabled` attribute, so a keyboard user
+    // sweeping the group still meets the option and the note explaining it.
+    expect(chips.some((c) => c.hasAttribute("disabled"))).toBe(false);
+
+    let fired = false;
+    el.addEventListener("config-changed", () => {
+      fired = true;
+    });
+    chips[0]?.click();
+    await el.updateComplete;
+    expect(fired).toBe(false);
+  });
+});

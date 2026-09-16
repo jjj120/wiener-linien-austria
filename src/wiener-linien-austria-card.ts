@@ -23,6 +23,7 @@ import {
   LINE_TYPE_S_BAHN,
   headerIconForType,
   lineTypeIcon,
+  transferModeOf,
 } from "./utils/mot.js";
 import type {
   DepartureAttr,
@@ -1756,7 +1757,14 @@ export class WienerLinienAustriaCard extends LitElement {
     // they're actually running. Outside the night window the N-chips
     // fold back into the +N toggle so the daytime trail stays compact.
     // Night window per `_isNightlineHour`.
-    const allLines = s.lines ?? [];
+    //
+    // `stops_ahead_modes` filters BEFORE the split, so hiding a category
+    // removes it from the inline chips and the +N panel alike — a user who
+    // switches off "Metro" means the U-chips, which are the inline half.
+    const allowedModes = this._config!.stops_ahead_modes;
+    const allLines = (s.lines ?? []).filter((l) =>
+      allowedModes.includes(transferModeOf(l)),
+    );
     const nightActive = this._isNightlineHour();
     const inlineLines: string[] = [];
     const otherLines: string[] = [];

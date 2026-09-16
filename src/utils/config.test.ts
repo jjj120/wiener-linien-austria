@@ -180,6 +180,13 @@ describe("normaliseModernConfig — defaults", () => {
     expect(c.show_hero_metric).toBe(true);
     expect(c.show_departures).toBe(true);
     expect(c.show_stops_ahead).toBe(true);
+    expect(c.stops_ahead_modes).toEqual([
+      "metro",
+      "sbahn",
+      "tram",
+      "bus",
+      "night",
+    ]);
     expect(c.show_qr_button).toBe(true);
     expect(c.hide_header).toBe(false);
     expect(c.hide_attribution).toBe(false);
@@ -443,5 +450,55 @@ describe("chipPalette — the four-step precedence ladder", () => {
         chipPalette(line, {}, gtfs).background,
       );
     }
+  });
+});
+
+describe("normaliseModernConfig — stops_ahead_modes", () => {
+  it("treats a missing key as every mode, so a pre-feature config is unchanged", () => {
+    expect(normaliseModernConfig({}).stops_ahead_modes).toEqual([
+      "metro",
+      "sbahn",
+      "tram",
+      "bus",
+      "night",
+    ]);
+  });
+
+  // The whole reason this field is not `cleanStringList`: absence and
+  // emptiness are different states, and collapsing them would make "hide
+  // every chip" impossible to save.
+  it("keeps an empty array empty rather than restoring the default", () => {
+    expect(normaliseModernConfig({ stops_ahead_modes: [] }).stops_ahead_modes).toEqual(
+      [],
+    );
+  });
+
+  it("re-sorts into signage order regardless of click order", () => {
+    expect(
+      normaliseModernConfig({ stops_ahead_modes: ["night", "tram", "metro"] })
+        .stops_ahead_modes,
+    ).toEqual(["metro", "tram", "night"]);
+  });
+
+  it("drops unknown entries and de-dupes", () => {
+    expect(
+      normaliseModernConfig({
+        stops_ahead_modes: ["bus", "bus", "ferry", 7, null, "metro"],
+      }).stops_ahead_modes,
+    ).toEqual(["metro", "bus"]);
+  });
+
+  it("falls back to every mode when the value is not an array", () => {
+    for (const bad of ["metro", null, 3, {}, undefined]) {
+      expect(normaliseModernConfig({ stops_ahead_modes: bad }).stops_ahead_modes).toEqual(
+        ["metro", "sbahn", "tram", "bus", "night"],
+      );
+    }
+  });
+
+  it("hands back a fresh array per call, so one config cannot mutate another", () => {
+    const a = normaliseModernConfig({});
+    const b = normaliseModernConfig({});
+    expect(a.stops_ahead_modes).not.toBe(b.stops_ahead_modes);
   });
 });

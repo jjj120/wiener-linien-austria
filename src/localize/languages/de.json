@@ -127,6 +127,13 @@
       "layout_stacked": "Gestapelt",
       "layout_tabs": "Reiter",
       "max_departures": "Anzahl Abfahrten pro Haltestelle",
+      "mode_bus": "Bus",
+      "mode_hidden_aria": "{mode} ist ausgeblendet",
+      "mode_metro": "U-Bahn",
+      "mode_night": "NightLine",
+      "mode_sbahn": "S-Bahn",
+      "mode_shown_aria": "{mode} wird angezeigt",
+      "mode_tram": "Straßenbahn",
       "pick_color_for_line": "Farbe für Linie {line} wählen",
       "reset_color": "Auf Standard zurücksetzen",
       "reset_color_aria": "Linienfarbe {line} auf Standard zurücksetzen",
@@ -136,6 +143,8 @@
       "section_disruptions": "Störungen & Verspätungen",
       "section_layout": "Aufbau",
       "section_layout_hint": "Struktur",
+      "section_transfers": "Umsteigemöglichkeiten",
+      "section_transfers_hint": "im Streckenverlauf",
       "show_accessibility": "Barrierefrei-Symbol anzeigen",
       "show_cooling": "Klimaanlagen-Symbol anzeigen",
       "show_cooling_helper": "Zeigt eine Schneeflocke neben Abfahrten mit klimatisiertem Fahrzeug. Wiener Linien melden das pro Fahrzeug — ältere Garnituren liefern die Angabe nicht.",
@@ -150,7 +159,9 @@
       "show_qr_button": "QR-Code-Schaltfläche anzeigen",
       "show_stops_ahead": "Zwischenstationen anzeigen",
       "show_traffic_info": "Störungen anzeigen",
-      "show_type_icon": "Verkehrsmittel-Symbol anzeigen"
+      "show_type_icon": "Verkehrsmittel-Symbol anzeigen",
+      "transfer_modes_hint": "Diese Verkehrsmittel erscheinen als Chips neben den Zwischenstationen.",
+      "transfer_modes_requires": "Braucht „Zwischenstationen anzeigen“."
     },
     "timetable_only": "nur Fahrplan",
     "timetable_title": "Fahrplanzeit, keine Echtzeitdaten"

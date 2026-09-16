@@ -61,8 +61,25 @@ import {
   type NormalisedModernStop,
 } from "./utils/config.js";
 import { colorSchemeOf } from "./utils/color.js";
+import {
+  TRANSFER_MODES,
+  TRANSFER_MODE_ICONS,
+  type TransferMode,
+} from "./utils/mot.js";
 import { collectLinesInSelection } from "./utils/departures.js";
 import { departureBoardOptions, mergeLineColorsMaps } from "./utils/entities.js";
+
+/** Editor label key per transfer mode. Spelled out rather than built as
+ *  `mode_${mode}`: the orphaned-key check in localize/localize.test.ts finds a
+ *  string by grepping the source for its leaf, so an interpolated key reads as
+ *  unreferenced and the catalogue entry looks safe to delete. */
+const TRANSFER_MODE_LABEL_KEYS: Readonly<Record<TransferMode, string>> = {
+  metro: "mode_metro",
+  sbahn: "mode_sbahn",
+  tram: "mode_tram",
+  bus: "mode_bus",
+  night: "mode_night",
+};
 
 @customElement("wiener-linien-austria-card-editor")
 export class WienerLinienAustriaCardEditor
@@ -257,6 +274,7 @@ export class WienerLinienAustriaCardEditor
           { name: "show_qr_button", selector: { boolean: {} } },
         ],
       })}
+      ${this._renderTransferModes()}
       ${renderFormSection({
         ...common,
         title: et("section_departure_row"),
@@ -301,6 +319,78 @@ export class WienerLinienAustriaCardEditor
         ],
       })}
     `;
+  }
+
+  /** Which vehicle categories get a transfer chip in the stops-ahead trail.
+   *
+   *  A chip row rather than five `boolean` schema rows: five near-identical
+   *  switches distinguish themselves only by their words, whereas a glyph
+   *  reads at a glance — and the row visually rhymes with the chips it
+   *  governs in the card. It reuses `.wl-chip`, the stop block's line-toggle
+   *  idiom, deliberately WITHOUT a colour override: a category is not a line,
+   *  and painting "Metro" in U1's red would assert something untrue. The
+   *  glyph identifies, the accent fill carries state.
+   *
+   *  Bespoke rather than a `select` with `multiple: true` for the same reason
+   *  the line colours are bespoke — this is a set, and ha-form's multi-select
+   *  renders it as a dropdown of words. */
+  private _renderTransferModes(): TemplateResult {
+    const cfg = this._config!;
+    const { et } = this._i18n;
+    // The chips govern the stops-ahead trail, so with the trail switched off
+    // there is nothing for them to act on.
+    const inert = !cfg.show_stops_ahead;
+    const picked = new Set(cfg.stops_ahead_modes);
+
+    return renderSection(
+      { title: et("section_transfers"), hint: et("section_transfers_hint") },
+      html`<div class="wl-group">
+        <span class="wl-note">
+          ${inert ? et("transfer_modes_requires") : et("transfer_modes_hint")}
+        </span>
+        <div class="wl-chips">
+          ${TRANSFER_MODES.map((mode) => {
+            const on = picked.has(mode);
+            const label = et(TRANSFER_MODE_LABEL_KEYS[mode]);
+            return html`<button
+              type="button"
+              class="wl-chip"
+              aria-pressed=${on ? "true" : "false"}
+              aria-disabled=${inert ? "true" : "false"}
+              aria-label=${et(on ? "mode_shown_aria" : "mode_hidden_aria").replace(
+                "{mode}",
+                label,
+              )}
+              @click=${(ev: Event) => {
+                // aria-disabled, not `disabled` — see dirButton in
+                // editor/stop-block.ts for why the button stays focusable.
+                if (inert) {
+                  ev.preventDefault();
+                  return;
+                }
+                this._toggleTransferMode(mode);
+              }}
+            >
+              <span class="wl-chip-mode"
+                ><ha-icon icon=${TRANSFER_MODE_ICONS[mode]} aria-hidden="true"></ha-icon
+              ></span>
+              ${label}
+            </button>`;
+          })}
+        </div>
+      </div>`,
+    );
+  }
+
+  private _toggleTransferMode(mode: TransferMode): void {
+    const cfg = this._config;
+    if (!cfg) return;
+    const next = cfg.stops_ahead_modes.includes(mode)
+      ? cfg.stops_ahead_modes.filter((m) => m !== mode)
+      : [...cfg.stops_ahead_modes, mode];
+    // Through the normaliser so the saved order stays signage order rather
+    // than click order.
+    this._patch({ stops_ahead_modes: next });
   }
 
   private _renderMisc(): TemplateResult {

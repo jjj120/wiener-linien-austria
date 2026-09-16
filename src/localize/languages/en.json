@@ -127,6 +127,13 @@
       "layout_stacked": "Stacked",
       "layout_tabs": "Tabs",
       "max_departures": "Departures per stop",
+      "mode_bus": "Bus",
+      "mode_hidden_aria": "{mode} hidden",
+      "mode_metro": "Metro",
+      "mode_night": "NightLine",
+      "mode_sbahn": "S-Bahn",
+      "mode_shown_aria": "{mode} shown",
+      "mode_tram": "Tram",
       "pick_color_for_line": "Pick colour for line {line}",
       "reset_color": "Reset to default",
       "reset_color_aria": "Reset line colour {line} to default",
@@ -136,6 +143,8 @@
       "section_disruptions": "Disruptions & delays",
       "section_layout": "Structure",
       "section_layout_hint": "Layout",
+      "section_transfers": "Transfer options",
+      "section_transfers_hint": "in the stops trail",
       "show_accessibility": "Show step-free icon",
       "show_cooling": "Show air-conditioning icon",
       "show_cooling_helper": "Shows a snowflake beside departures with an air-conditioned vehicle. Wiener Linien report this per vehicle — older trains and trams don't send it.",
@@ -150,7 +159,9 @@
       "show_qr_button": "Show QR-code button",
       "show_stops_ahead": "Show intermediate stops",
       "show_traffic_info": "Show disruption alerts",
-      "show_type_icon": "Show vehicle-type icon"
+      "show_type_icon": "Show vehicle-type icon",
+      "transfer_modes_hint": "These modes appear as chips beside each intermediate stop.",
+      "transfer_modes_requires": "Requires “Show intermediate stops”."
     },
     "timetable_only": "Timetable only",
     "timetable_title": "Scheduled time, no live data"

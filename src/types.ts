@@ -5,6 +5,9 @@
 // `fireEvent` has one implementation, in utils.ts, which all four
 // editors import.
 
+// Type-only, and mot.ts imports nothing, so this cannot form a cycle.
+import type { TransferMode } from "./utils/mot.js";
+
 /** Single entity in `hass.states`. The attributes bag is open-ended —
  *  the integration's coordinator emits the keys these cards read
  *  (`departures`, `traffic_info`, `elevator_info`, `attribution`, …). */
@@ -397,6 +400,9 @@ export interface WienerLinienCardConfig extends LovelaceCardConfig {
   show_hero_metric?: boolean | undefined;
   show_departures?: boolean | undefined;
   show_stops_ahead?: boolean | undefined;
+  /** Vehicle categories that get a transfer chip in the stops-ahead trail.
+   *  Omit the key for all five; an empty array hides every chip. */
+  stops_ahead_modes?: TransferMode[] | undefined;
   show_qr_button?: boolean | undefined;
   hide_header?: boolean | undefined;
   hide_attribution?: boolean | undefined;
