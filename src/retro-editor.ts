@@ -55,6 +55,7 @@ import {
   editorLabel,
 } from "./editor/editor-common.js";
 import { normaliseRetroConfig, type NormalisedRetroConfig } from "./utils/config.js";
+import { departureBoardOptions } from "./utils/entities.js";
 import { directionSurface, linesForDirection } from "./utils/departures.js";
 
 @customElement("wiener-linien-austria-retro-card-editor")
@@ -222,7 +223,10 @@ export class WienerLinienAustriaRetroCardEditor
             required: true,
             selector: {
               entity: {
-                filter: { domain: "sensor", integration: "wiener_linien_austria" },
+                include_entities: departureBoardOptions(
+                  this.hass,
+                  cfg.entity ? [cfg.entity] : [],
+                ),
               },
             },
           },

@@ -51,6 +51,7 @@ import type {
   WienerLinienFlapCardConfig,
 } from "./types.js";
 import { fireEvent } from "./utils.js";
+import { departureBoardOptions } from "./utils/entities.js";
 import {
   normaliseFlapConfig,
   type NormalisedFlapConfig,
@@ -181,7 +182,10 @@ export class WienerLinienAustriaFlapCardEditor
             selector: {
               entity: {
                 multiple: true,
-                filter: { domain: "sensor", integration: "wiener_linien_austria" },
+                include_entities: departureBoardOptions(
+                  this.hass,
+                  cfg.entities.map((s) => s.entity),
+                ),
               },
             },
           },

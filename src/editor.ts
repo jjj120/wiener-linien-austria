@@ -62,7 +62,7 @@ import {
 } from "./utils/config.js";
 import { colorSchemeOf } from "./utils/color.js";
 import { collectLinesInSelection } from "./utils/departures.js";
-import { mergeLineColorsMaps } from "./utils/entities.js";
+import { departureBoardOptions, mergeLineColorsMaps } from "./utils/entities.js";
 
 @customElement("wiener-linien-austria-card-editor")
 export class WienerLinienAustriaCardEditor
@@ -164,7 +164,10 @@ export class WienerLinienAustriaCardEditor
             selector: {
               entity: {
                 multiple: true,
-                filter: { domain: "sensor", integration: "wiener_linien_austria" },
+                include_entities: departureBoardOptions(
+                  this.hass,
+                  cfg.entities.map((s) => s.entity),
+                ),
               },
             },
           },
