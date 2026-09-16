@@ -580,6 +580,94 @@ describe("rendering", () => {
     expect(text(el)).toContain("08:00 bis 08:16, 1 Umstieg");
   });
 
+  it("opens an alternative into its own strand, with matching ARIA state", async () => {
+    const el = await mount(hass("x", ACTIVE), { entity: ENTITY });
+    root(el).querySelector<HTMLButtonElement>(".alt-toggle")?.click();
+    await el.updateComplete;
+
+    const row = root(el).querySelector<HTMLButtonElement>(".alt-summary")!;
+    const detail = root(el).querySelector<HTMLElement>(".alt-detail")!;
+    expect(row.getAttribute("aria-expanded")).toBe("false");
+    expect(row.getAttribute("aria-controls")).toBe(detail.id);
+    expect(detail.hidden).toBe(true);
+    // Closed rows draw nothing, so the hero's strand is the only one.
+    expect(root(el).querySelectorAll(".strand")).toHaveLength(1);
+
+    row.click();
+    await el.updateComplete;
+    expect(row.getAttribute("aria-expanded")).toBe("true");
+    expect(detail.hidden).toBe(false);
+    // The 08:00 connection's own strand, not a copy of the best one's —
+    // and it keeps the ride's delay, struck through as on the hero.
+    const strand = detail.querySelector(".strand")!;
+    expect(strand.querySelector(".stop s.time-planned")?.textContent).toBe("08:00");
+    expect(strand.querySelector(".stop time.time-late")?.textContent).toBe("08:02");
+    expect(strand.textContent).toContain("Richtung Simmering");
+    expect(strand.textContent).toContain("Praterstern");
+
+    row.click();
+    await el.updateComplete;
+    expect(row.getAttribute("aria-expanded")).toBe("false");
+    expect(detail.querySelector(".strand")).toBeNull();
+  });
+
+  it("asks nothing of the planner to open an alternative", async () => {
+    const callWS = vi.fn();
+    const h = { ...hass("x", ACTIVE), callWS } as unknown as HomeAssistant;
+    const el = await mount(h, { entity: ENTITY });
+    const before = callWS.mock.calls.filter(([msg]) => msg?.type !== "wiener_linien_austria/card_version").length;
+    root(el).querySelector<HTMLButtonElement>(".alt-toggle")?.click();
+    await el.updateComplete;
+    root(el).querySelector<HTMLButtonElement>(".alt-summary")?.click();
+    await el.updateComplete;
+    const after = callWS.mock.calls.filter(([msg]) => msg?.type !== "wiener_linien_austria/card_version").length;
+    expect(after).toBe(before);
+  });
+
+  it("keeps an opened alternative open through a refresh", async () => {
+    const el = await mount(hass("x", ACTIVE), { entity: ENTITY });
+    root(el).querySelector<HTMLButtonElement>(".alt-toggle")?.click();
+    await el.updateComplete;
+    root(el).querySelector<HTMLButtonElement>(".alt-summary")?.click();
+    await el.updateComplete;
+
+    // A new state object, as the next poll delivers: a delay lands on the
+    // open connection. Its planned times, and so its key, stay the same.
+    const refreshed = ACTIVE.trips.map((t, i) =>
+      i === 1
+        ? { ...t, legs: [{ ...t.legs[0]!, origin: { ...t.legs[0]!.origin, delay_minutes: 4 } }, t.legs[1]!] }
+        : t,
+    );
+    el.hass = hass("y", { ...ACTIVE, trips: refreshed });
+    await el.updateComplete;
+    expect(root(el).querySelector(".alt-summary")?.getAttribute("aria-expanded")).toBe("true");
+  });
+
+  // Two connections that board the same ride and part only at the change are
+  // the ordinary case. Their strands must not share ids, nor one open state.
+  it("keeps a shared ride's stop list apart between the best and an alternative", async () => {
+    const best = trip("07:57", "08:11");
+    const sameStart: RouteTripAttr = {
+      ...best,
+      arrival: "2026-09-14T08:20:00+02:00",
+      legs: [best.legs[0]!, { ...best.legs[1]!, line: "N36", towards: "Kagran" }],
+    };
+    const el = await mount(hass("x", { ...ACTIVE, trips: [best, sameStart] }), { entity: ENTITY });
+    root(el).querySelector<HTMLButtonElement>(".alt-toggle")?.click();
+    await el.updateComplete;
+    root(el).querySelector<HTMLButtonElement>(".alt-summary")?.click();
+    await el.updateComplete;
+
+    const ids = [...root(el).querySelectorAll("[id]")].map((n) => n.id);
+    expect(new Set(ids).size).toBe(ids.length);
+
+    const [heroToggle, altToggle] = [...root(el).querySelectorAll<HTMLButtonElement>(".stops-toggle")];
+    altToggle!.click();
+    await el.updateComplete;
+    expect(altToggle!.getAttribute("aria-expanded")).toBe("true");
+    expect(heroToggle!.getAttribute("aria-expanded")).toBe("false");
+  });
+
   it("hides the alternatives and the credit when configured to", async () => {
     const el = await mount(hass("x", ACTIVE), {
       entity: ENTITY,

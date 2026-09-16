@@ -236,6 +236,16 @@ export function rideKey(leg: RouteLegAttr): string {
   return [leg.line, leg.direction, leg.origin.stop_id, leg.origin.planned].join("|");
 }
 
+/** Identifies a connection across refreshes, for the alternatives a user has
+ *  opened. Built from its rides' `rideKey`s, which use planned times, so a
+ *  delay arriving in the next update doesn't close the row under someone
+ *  reading it. A connection with no ride (walk only) falls back to its
+ *  departure time. */
+export function tripKey(trip: RouteTripAttr): string {
+  const rides = transitLegs(trip).map(rideKey);
+  return rides.length ? rides.join(">") : `walk|${trip.departure}`;
+}
+
 export function transitLegs(trip: RouteTripAttr): RouteLegAttr[] {
   return trip.legs.filter((leg) => !leg.walk && !!leg.line);
 }

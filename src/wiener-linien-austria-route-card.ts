@@ -74,6 +74,7 @@ import {
   loadAdhocSelection,
   rideFrequency,
   rideKey,
+  tripKey,
   roundedClock,
   minutesUntil,
   normaliseRouteConfig,
@@ -155,6 +156,9 @@ export class WienerLinienAustriaRouteCard extends LitElement {
   /** Rides whose stops are open, by `rideKey`. Survives refreshes, so a list
    *  someone opened doesn't snap shut when the plan updates under it. */
   @state() private _openRides: ReadonlySet<string> = new Set();
+  /** Alternatives opened to their full strand, by `tripKey`. Same reasoning:
+   *  a refresh must not snap a row shut while someone reads it. */
+  @state() private _openAlternatives: ReadonlySet<string> = new Set();
 
   // --- Ad-hoc mode (no `entity`) ---------------------------------------
   @state() private _stops: AdhocStopOption[] | null = null;
@@ -443,6 +447,7 @@ export class WienerLinienAustriaRouteCard extends LitElement {
     if (this._planKey !== key) {
       this._plan = null;
       this._alternativesOpen = false;
+      this._openAlternatives = new Set();
     }
     if (!this._plan) this._phase = "loading";
     try {
@@ -1038,7 +1043,12 @@ export class WienerLinienAustriaRouteCard extends LitElement {
     return this._t(track ? "platform_track" : "platform_stop", { p: platform });
   }
 
-  private _renderStrand(trip: RouteTripAttr, attrs: RouteAttrs): TemplateResult {
+  /** `scope` keeps an alternative's strand apart from the best one's. Two
+   *  connections often share their first ride and differ only at the change,
+   *  and a shared ride would otherwise mean duplicate ids in one shadow root
+   *  and one stops list opening both. The best connection passes none, so its
+   *  open lists keep their keys across refreshes as before. */
+  private _renderStrand(trip: RouteTripAttr, attrs: RouteAttrs, scope = ""): TemplateResult {
     const legs = transitLegs(trip);
     const last = legs[legs.length - 1];
     return html`
@@ -1055,6 +1065,7 @@ export class WienerLinienAustriaRouteCard extends LitElement {
               !!transfer && i < legs.length - 1,
               legs[i + 1],
               i === 0 ? walkAccess(trip, "start") : undefined,
+              scope,
             )}
             ${transfer && i < legs.length - 1
               ? this._renderTransfer(transfer, attrs, catchableDeparture(leg, transfer, legs[i + 1]!))
@@ -1084,6 +1095,7 @@ export class WienerLinienAustriaRouteCard extends LitElement {
     beforeTransfer: boolean,
     nextLeg: RouteLegAttr | undefined,
     accessBefore?: RouteAccessStepAttr[],
+    scope = "",
   ): TemplateResult {
     const icon = legTypeIcon(leg.type, leg.line);
     const stops =
@@ -1093,7 +1105,7 @@ export class WienerLinienAustriaRouteCard extends LitElement {
     const between = leg.stops ?? [];
     // The stops in between already carry the ride's delay; show them late too.
     const late = !!delayedClock(leg.origin);
-    const key = rideKey(leg);
+    const key = scope ? `${scope}#${rideKey(leg)}` : rideKey(leg);
     const open = between.length > 0 && this._openRides.has(key);
     const listId = safeDomId(`route-stops-${key}`);
     // Shown with the ride, not the stop: the platform belongs to this line's
@@ -1324,6 +1336,9 @@ export class WienerLinienAustriaRouteCard extends LitElement {
     `;
   }
 
+  /** One more connection: a summary row that opens into the same strand the
+   *  best connection shows, from data the plan already carries. No request,
+   *  and it can't turn into a different connection than the one clicked. */
   private _renderAlternative(trip: RouteTripAttr, attrs: RouteAttrs): TemplateResult {
     const worst = trip.transfers.reduce<RouteTransferAttr | undefined>(
       (acc, t) => (acc === undefined || t.slack_minutes < acc.slack_minutes ? t : acc),
@@ -1334,36 +1349,67 @@ export class WienerLinienAustriaRouteCard extends LitElement {
     // at the walk's time, which no delay moves.
     const first = trip.legs[0];
     const delayed = first && !first.walk ? delayedClock(first.origin) : null;
+    const key = tripKey(trip);
+    const open = this._openAlternatives.has(key);
+    const detailId = safeDomId(`route-alt-detail-${key}`);
     return html`
-      <li class="alt">
-        <span class="alt-times">
-          <span aria-hidden="true"
-            >${delayed
-              ? html`<s class="time-planned">${delayed.planned}</s>
-                  <span class="time-late">${delayed.expected}</span>`
-              : clockOf(trip.departure)}
-            – ${clockOf(trip.arrival)}</span
-          >
-          <span class="sr-only"
-            >${this._tripSummary(trip)}${delayed
-              ? `, ${this._t("planned_late", {
-                  time: delayed.planned,
-                  n: first?.origin.delay_minutes ?? 0,
-                })}`
-              : ""}</span
-          >
-        </span>
-        <span class="alt-lines">
-          ${transitLegs(trip).map((leg) => this._renderBadge(leg, attrs))}
-        </span>
-        <span class="alt-meta">
-          ${trip.duration_minutes !== null
-            ? this._t("minutes", { n: trip.duration_minutes })
-            : ""}
-        </span>
-        ${worst ? this._renderRisk(worst) : nothing}
+      <li class=${open ? "alt alt--open" : "alt"}>
+        <button
+          type="button"
+          class="alt-summary"
+          aria-expanded=${open ? "true" : "false"}
+          aria-controls=${detailId}
+          @click=${() => this._toggleAlternative(key)}
+        >
+          <span class="alt-times">
+            <span aria-hidden="true"
+              >${delayed
+                ? html`<s class="time-planned">${delayed.planned}</s>
+                    <span class="time-late">${delayed.expected}</span>`
+                : clockOf(trip.departure)}
+              – ${clockOf(trip.arrival)}</span
+            >
+            <span class="sr-only"
+              >${this._tripSummary(trip)}${delayed
+                ? `, ${this._t("planned_late", {
+                    time: delayed.planned,
+                    n: first?.origin.delay_minutes ?? 0,
+                  })}`
+                : ""}</span
+            >
+          </span>
+          <span class="alt-lines">
+            ${transitLegs(trip).map((leg) => this._renderBadge(leg, attrs))}
+          </span>
+          <span class="alt-meta">
+            ${trip.duration_minutes !== null
+              ? this._t("minutes", { n: trip.duration_minutes })
+              : ""}
+          </span>
+          ${worst ? this._renderRisk(worst) : nothing}
+          <ha-icon
+            class="alt-chevron"
+            icon=${open ? "mdi:chevron-up" : "mdi:chevron-down"}
+            aria-hidden="true"
+          ></ha-icon>
+        </button>
+        <!-- Always in the DOM so aria-controls resolves; filled only when open,
+             since every alternative drawing its strand up front would be most
+             of the card's DOM for rows nobody opened. -->
+        <div class="alt-detail" id=${detailId} ?hidden=${!open}>
+          ${open
+            ? html`${this._renderNotices(trip, attrs)}
+              ${this._renderStrand(trip, attrs, `alt-${key}`)}`
+            : nothing}
+        </div>
       </li>
     `;
+  }
+
+  private _toggleAlternative(key: string): void {
+    const next = new Set(this._openAlternatives);
+    if (!next.delete(key)) next.add(key);
+    this._openAlternatives = next;
   }
 
   static override styles = css`
@@ -1931,12 +1977,47 @@ export class WienerLinienAustriaRouteCard extends LitElement {
       display: none;
     }
     .alt {
+      border-top: 1px solid var(--divider-color, rgba(127, 127, 127, 0.3));
+    }
+    /* The whole row is the button. Nothing inside it is interactive (no map
+       pins in the summary), so there is no nested control to fight. The
+       negative margin bleeds the hover wash 8px past the text, keeping the
+       times aligned with the toggle above; the card pads at least 12px and
+       ha-card clips, so the bleed and focus ring stay inside the card. */
+    .alt-summary {
       display: flex;
       flex-wrap: wrap;
       align-items: center;
       gap: 6px 10px;
-      padding-block: 8px;
-      border-top: 1px solid var(--divider-color, rgba(127, 127, 127, 0.3));
+      width: calc(100% + 16px);
+      min-height: 44px;
+      margin-inline: -8px;
+      padding: 8px;
+      border: none;
+      border-radius: var(--wl-radius-sm);
+      background: none;
+      color: inherit;
+      font: inherit;
+      text-align: start;
+      cursor: pointer;
+    }
+    .alt-summary:hover {
+      background: color-mix(in srgb, var(--primary-text-color) 6%, transparent);
+    }
+    /* Pushed to the end of the row, so the times stay where the eye looks. */
+    .alt-chevron {
+      --mdc-icon-size: 20px;
+      margin-inline-start: auto;
+      color: var(--secondary-text-color);
+    }
+    .alt-detail {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding-block: 4px 12px;
+    }
+    .alt-detail[hidden] {
+      display: none;
     }
     .alt:first-child {
       border-top: none;
@@ -2282,6 +2363,7 @@ export class WienerLinienAustriaRouteCard extends LitElement {
     }
 
     .alt-toggle:focus-visible,
+    .alt-summary:focus-visible,
     .stops-toggle:focus-visible,
     .map-link:focus-visible,
     .combo-field input:focus-visible,

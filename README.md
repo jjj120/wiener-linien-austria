@@ -324,7 +324,7 @@ What the card shows:
 - **Buffer on every change** — walking time plus a grade: enough time, tight, or at risk when the current times say the change no longer fits. The grade is written out, not just coloured.
 - **Disruptions** for the lines the trip uses.
 - **Lifts and stairs** *(2.0.0)* — on a step-free trip, each lift on the way to the platform, at a change and at the destination, for example *Lift down*. A lift at a station with an outage says *out of service*, and a warning names the station. Rides planned with a low-floor vehicle show a wheelchair icon.
-- **More connections** — up to three later options, folded away until you open them.
+- **More connections** — up to three later options, folded away until you open them. Tap one to see its rides, stops and changes in full *(2.1.0)*.
 - **Last connection** *(2.0.0)* — for a route, from 22:00: the night's last connection without a night bus, for example *Last connection without night bus 00:20*.
 - **Last updated** (*Zuletzt aktualisiert* on a German install) — the time the trip planner last answered, next to the heading, so a plan kept on screen can't pass for a fresh one.
 
