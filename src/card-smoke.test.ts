@@ -426,8 +426,8 @@ describe("tab-scoped alert banner", () => {
 // stops_ahead_modes — which transfer categories get a chip in the trail.
 // ---------------------------------------------------------------------------
 
-/** One stop with a transfer from each of the five categories. `43` is the
- *  tram, `13A` the city bus, `N38` the NightLine. */
+/** One stop with a transfer from each of the six categories. `43` is the
+ *  tram, `WLB` the Badner Bahn, `13A` the city bus, `N38` the NightLine. */
 function trailHass(): HomeAssistant {
   return {
     language: "de",
@@ -454,7 +454,10 @@ function trailHass(): HomeAssistant {
               time_real: "2026-09-09T16:38:30.000+0200",
               realtime: true,
               stops_ahead: [
-                { name: "Zieglergasse", lines: ["U3", "S45", "43", "13A", "N38"] },
+                {
+                  name: "Zieglergasse",
+                  lines: ["U3", "S45", "43", "WLB", "13A", "N38"],
+                },
               ],
             },
           ],
@@ -494,16 +497,16 @@ async function mountTrail(modes?: unknown): Promise<CardElement> {
 describe("stops_ahead_modes", () => {
   it("chips every category when the key is absent", async () => {
     const { inline, total } = trailChips(await mountTrail());
-    expect(total).toBe(5);
+    expect(total).toBe(6);
     expect(inline).toContain("U3");
     expect(inline).toContain("S45");
   });
 
   it("drops the U-chips when metro is off", async () => {
     const { inline, total } = trailChips(
-      await mountTrail(["sbahn", "tram", "bus", "night"]),
+      await mountTrail(["sbahn", "tram", "badner", "bus", "night"]),
     );
-    expect(total).toBe(4);
+    expect(total).toBe(5);
     expect(inline).not.toContain("U3");
     expect(inline).toContain("S45");
   });
@@ -513,11 +516,27 @@ describe("stops_ahead_modes", () => {
   // pins is "metro off, U-chip still there".
   it("drops the S-chips when sbahn is off", async () => {
     const { inline, total } = trailChips(
-      await mountTrail(["metro", "tram", "bus", "night"]),
+      await mountTrail(["metro", "tram", "badner", "bus", "night"]),
     );
-    expect(total).toBe(4);
+    expect(total).toBe(5);
     expect(inline).not.toContain("S45");
     expect(inline).toContain("U3");
+  });
+
+  // The Badner Bahn used to fall into `tram`, so this is the case that pins
+  // the split: hiding trams must leave the WLB chip alone, and vice versa.
+  it("hides the Badner Bahn without touching the trams", async () => {
+    const { total } = trailChips(
+      await mountTrail(["metro", "sbahn", "tram", "bus", "night"]),
+    );
+    expect(total).toBe(5);
+  });
+
+  it("hides the trams without touching the Badner Bahn", async () => {
+    const { total } = trailChips(
+      await mountTrail(["metro", "sbahn", "badner", "bus", "night"]),
+    );
+    expect(total).toBe(5);
   });
 
   it("keeps only the rail categories when tram, bus and night are off", async () => {

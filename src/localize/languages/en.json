@@ -127,6 +127,7 @@
       "layout_stacked": "Stacked",
       "layout_tabs": "Tabs",
       "max_departures": "Departures per stop",
+      "mode_badner": "Badner Bahn",
       "mode_bus": "Bus",
       "mode_hidden_aria": "{mode} hidden",
       "mode_metro": "Metro",

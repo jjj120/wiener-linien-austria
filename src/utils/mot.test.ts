@@ -56,16 +56,33 @@ describe("transferModeOf", () => {
     }
   });
 
-  it("classifies trams — numeric, letter and the Badner Bahn", () => {
-    for (const l of ["1", "2", "6", "18", "43", "71", "D", "O", "WLB"]) {
+  it("classifies trams — the numeric and letter lines", () => {
+    for (const l of ["1", "2", "6", "18", "43", "71", "D", "O"]) {
       expect(transferModeOf(l)).toBe("tram");
     }
+  });
+
+  // Its own category, not a tram: linien.csv tags LineID 399 `ptTramWLB`,
+  // _MOT_SORT_RANK gives it a dedicated tier, and it carries the palette's
+  // only pure-black colour. The toggle row was the last place calling it
+  // a tram.
+  it("classifies the Badner Bahn as its own mode", () => {
+    expect(transferModeOf("WLB")).toBe("badner");
+    expect(transferModeOf("wlb")).toBe("badner");
+  });
+
+  // `LB` is the linien.csv spelling; canonicalLineLabel folds it onto WLB
+  // upstream of every classification, so transferModeOf never meets it. If
+  // that ever changes this test is the tripwire.
+  it("does not special-case the legacy LB spelling, which is folded upstream", () => {
+    expect(transferModeOf("LB")).toBe("tram");
   });
 
   it("is case-insensitive, so a hand-written config label still classifies", () => {
     expect(transferModeOf("u1")).toBe("metro");
     expect(transferModeOf("n25")).toBe("night");
     expect(transferModeOf("13a")).toBe("bus");
+    expect(transferModeOf("wlb")).toBe("badner");
   });
 
   // Falling through to `tram` is the deliberate choice: a toggle the user

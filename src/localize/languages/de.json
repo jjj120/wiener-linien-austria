@@ -127,6 +127,7 @@
       "layout_stacked": "Gestapelt",
       "layout_tabs": "Reiter",
       "max_departures": "Anzahl Abfahrten pro Haltestelle",
+      "mode_badner": "Badner Bahn",
       "mode_bus": "Bus",
       "mode_hidden_aria": "{mode} ist ausgeblendet",
       "mode_metro": "U-Bahn",

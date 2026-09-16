@@ -184,6 +184,7 @@ describe("normaliseModernConfig — defaults", () => {
       "metro",
       "sbahn",
       "tram",
+      "badner",
       "bus",
       "night",
     ]);
@@ -459,6 +460,7 @@ describe("normaliseModernConfig — stops_ahead_modes", () => {
       "metro",
       "sbahn",
       "tram",
+      "badner",
       "bus",
       "night",
     ]);
@@ -491,7 +493,7 @@ describe("normaliseModernConfig — stops_ahead_modes", () => {
   it("falls back to every mode when the value is not an array", () => {
     for (const bad of ["metro", null, 3, {}, undefined]) {
       expect(normaliseModernConfig({ stops_ahead_modes: bad }).stops_ahead_modes).toEqual(
-        ["metro", "sbahn", "tram", "bus", "night"],
+        ["metro", "sbahn", "tram", "badner", "bus", "night"],
       );
     }
   });

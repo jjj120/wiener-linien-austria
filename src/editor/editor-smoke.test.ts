@@ -282,17 +282,20 @@ describe("transfer-mode chips (modern, Anzeige tab)", () => {
 
   it("renders one chip per mode, all pressed by default", async () => {
     const chips = modeChips(await onDisplayTab());
-    expect(chips).toHaveLength(5);
+    expect(chips).toHaveLength(6);
     expect(chips.map((c) => c.getAttribute("aria-pressed"))).toEqual(
-      Array(5).fill("true"),
+      Array(6).fill("true"),
     );
   });
 
-  it("reflects a saved subset rather than always showing all five as on", async () => {
+  it("reflects a saved subset rather than always showing every chip as on", async () => {
     const chips = modeChips(await onDisplayTab({ stops_ahead_modes: ["metro", "bus"] }));
-    // Chips render in TRANSFER_MODES order: metro, sbahn, tram, bus, night.
+    // Chips render in TRANSFER_MODES order, which is the order the Python
+    // side already sorts the chips into: metro, sbahn, tram, badner, bus,
+    // night (see _MOT_SORT_RANK in static.py).
     expect(chips.map((c) => c.getAttribute("aria-pressed"))).toEqual([
       "true",
+      "false",
       "false",
       "false",
       "true",
@@ -310,7 +313,13 @@ describe("transfer-mode chips (modern, Anzeige tab)", () => {
     modeChips(el)[0]?.click();
     await el.updateComplete;
 
-    expect(config?.["stops_ahead_modes"]).toEqual(["sbahn", "tram", "bus", "night"]);
+    expect(config?.["stops_ahead_modes"]).toEqual([
+      "sbahn",
+      "tram",
+      "badner",
+      "bus",
+      "night",
+    ]);
   });
 
   // Empty must survive the round-trip: the normaliser reads a missing key as
@@ -333,7 +342,7 @@ describe("transfer-mode chips (modern, Anzeige tab)", () => {
     const el = await onDisplayTab({ show_stops_ahead: false });
     const chips = modeChips(el);
     expect(chips.map((c) => c.getAttribute("aria-disabled"))).toEqual(
-      Array(5).fill("true"),
+      Array(6).fill("true"),
     );
     // aria-disabled rather than the `disabled` attribute, so a keyboard user
     // sweeping the group still meets the option and the note explaining it.

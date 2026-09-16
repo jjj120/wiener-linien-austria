@@ -77,6 +77,7 @@ const TRANSFER_MODE_LABEL_KEYS: Readonly<Record<TransferMode, string>> = {
   metro: "mode_metro",
   sbahn: "mode_sbahn",
   tram: "mode_tram",
+  badner: "mode_badner",
   bus: "mode_bus",
   night: "mode_night",
 };

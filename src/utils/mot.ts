@@ -60,7 +60,14 @@ export function headerIconForType(type: string | undefined): string {
 // `/^N\d/` for nightlines) keeps one rule rather than two that can disagree.
 
 /** The five categories a user can show or hide, in signage order. */
-export const TRANSFER_MODES = ["metro", "sbahn", "tram", "bus", "night"] as const;
+export const TRANSFER_MODES = [
+  "metro",
+  "sbahn",
+  "tram",
+  "badner",
+  "bus",
+  "night",
+] as const;
 
 export type TransferMode = (typeof TRANSFER_MODES)[number];
 
@@ -69,9 +76,18 @@ export const TRANSFER_MODE_ICONS: Readonly<Record<TransferMode, string>> = {
   metro: "mdi:subway-variant",
   sbahn: "mdi:train",
   tram: "mdi:tram",
+  // Distinct from the tram glyph on purpose: the whole point of the split is
+  // that a WLB chip is not a tram chip, and two identical glyphs would undo
+  // that in the one place the user actually looks.
+  badner: "mdi:tram-side",
   bus: "mdi:bus",
   night: "mdi:weather-night",
 };
+
+/** The Badner Bahn's realtime label. `LB` is the `linien.csv` spelling and is
+ *  folded onto this one by `canonicalLineLabel` before any classification, so
+ *  matching the realtime label alone is sufficient here. */
+const BADNER_BAHN_LABEL = "WLB";
 
 /**
  * Classify a Wiener Linien line label into one of `TRANSFER_MODES`.
@@ -80,8 +96,15 @@ export const TRANSFER_MODE_ICONS: Readonly<Record<TransferMode, string>> = {
  * the user toggles it as one — so the N-prefix is tested before the bus
  * shape it would otherwise match. After the three prefixed families, a
  * digits-then-letter label (`13A`, `25B`) is a city bus; everything left is
- * a tram, which correctly catches the numeric lines (`1`, `71`), the letter
- * lines (`D`, `O`) and the Badner Bahn (`WLB`).
+ * a tram, which correctly catches the numeric lines (`1`, `71`) and the
+ * letter lines (`D`, `O`).
+ *
+ * The Badner Bahn is its own category rather than a tram, matching the rest
+ * of the codebase: `linien.csv` tags LineID 399 `ptTramWLB` (not `ptTram`),
+ * `_MOT_SORT_RANK` in static.py gives it a dedicated tier — so the chips
+ * already arrive ordered Metro → Tram → Badner Bahn → Bus → Nightline — and
+ * it carries the palette's only pure-black colour. It is a single named
+ * line, so this is an exact match, not a heuristic like the tram fallback.
  *
  * An unrecognised future label lands in `tram` rather than being dropped:
  * a category toggle the user left ON should not silently swallow a line the
@@ -92,6 +115,7 @@ export function transferModeOf(label: string): TransferMode {
   if (/^N\d/.test(upper)) return "night";
   if (/^U\d/.test(upper)) return "metro";
   if (/^S\d/.test(upper)) return "sbahn";
+  if (upper === BADNER_BAHN_LABEL) return "badner";
   if (/^\d+[A-Z]$/.test(upper)) return "bus";
   return "tram";
 }
