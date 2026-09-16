@@ -1698,9 +1698,24 @@ export class WienerLinienAustriaRouteCard extends LitElement {
       color: color-mix(in srgb, var(--wl-error) 85%, var(--primary-text-color));
       font-weight: 700;
     }
+    /* Centred on the TIME's optical centre, not on the row.
+       align-self: center centred it against the .stop box instead, which
+       min-height: var(--stop-row) makes taller than its line of text — so
+       the text sat baseline-aligned near the top while the icon centred in
+       the whole 22px, and the icon read low. Same trap the map pin and the
+       .access row above each document.
+       So: explicit width/height for a box of exactly the glyph (no
+       line-height or descender space in it), bottom edge on the text
+       baseline, then down by the difference between that box's centre and
+       the cap-height centre of the text. 0.35em is half a cap height, which
+       keeps this correct if the row's font-size ever changes. */
     .live-mark {
       --mdc-icon-size: 16px;
-      align-self: center;
+      display: flex;
+      align-self: baseline;
+      width: var(--mdc-icon-size);
+      height: var(--mdc-icon-size);
+      transform: translateY(calc(var(--mdc-icon-size) / 2 - 0.35em));
       color: var(--wl-rt);
     }
     /* The label's text carries the box's baseline, so on the baseline-aligned

@@ -754,7 +754,11 @@ font-weight: 700;
 }
 .live-mark {
 --mdc-icon-size: 16px;
-align-self: center;
+display: flex;
+align-self: baseline;
+width: var(--mdc-icon-size);
+height: var(--mdc-icon-size);
+transform: translateY(calc(var(--mdc-icon-size) / 2 - 0.35em));
 color: var(--wl-rt);
 }
 .access {
