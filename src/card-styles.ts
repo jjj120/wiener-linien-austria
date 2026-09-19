@@ -869,10 +869,12 @@ export const cardStyles = css`
      Only rendered when a notice has two or more — a lone heading segments
      nothing and merely restates the line already in the alert title, so
      _renderTrafficNotice drops it. */
+  /* No accent rule down the side: the caps, weight and tracking already mark
+     this as a heading, and the bar spent the line colour — which on this card
+     means "this line" — on something carrying no line. Flush left, so the
+     per-line blocks share one edge with the prose under them. */
   .alert-desc-heading {
     margin: 14px 0 6px;
-    padding-left: 8px;
-    border-left: 3px solid var(--wl-accent);
     color: var(--primary-text-color);
     font-size: 0.78rem;
     font-weight: 700;

@@ -52,6 +52,7 @@ import {
   iconForElevatorReason,
   parseTrafficNotice,
   splitLocationPath,
+  trimTitleLinePrefix,
   type TrafficNotice,
 } from "./utils/traffic-notice.js";
 import { mdiPathForIcon } from "./utils/mdi-paths.js";
@@ -1295,7 +1296,11 @@ export class WienerLinienAustriaCard extends LitElement {
                   )}
                 </div>`
               : nothing}
-            <div class="alert-title">${t.title ? deText(t.title) : this._t("traffic_label")}</div>
+            <!-- The badges above already name the lines, so the title drops
+                 the line list it repeats (see trimTitleLinePrefix). -->
+            <div class="alert-title">
+              ${t.title ? deText(trimTitleLinePrefix(t.title, lines)) : this._t("traffic_label")}
+            </div>
           </div>
           ${hasDetail
             ? html`<div class="alert-detail">

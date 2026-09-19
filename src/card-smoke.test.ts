@@ -354,6 +354,11 @@ describe("tab-scoped alert banner", () => {
     return base;
   }
 
+  const alertBadges = (el: CardElement): string[] =>
+    [...shadow(el).querySelectorAll(".alert-line-badge")].map(
+      (n) => n.textContent?.trim() ?? "",
+    );
+
   const tabsConfig = {
     type: `custom:${MODERN}`,
     layout: "tabs",
@@ -363,12 +368,15 @@ describe("tab-scoped alert banner", () => {
 
   it("shows only the open tab's disruptions", async () => {
     const el = await mount(MODERN, twoStopHass(), tabsConfig);
+    // The title drops the line list its badge already carries, so the line
+    // is asserted on the badge and the fault on the title.
+    expect(alertBadges(el)).toEqual(["U3"]);
     const text = shadow(el).textContent ?? "";
-    expect(text).toContain("U3: Verspätungen");
+    expect(text).toContain("Verspätungen");
     // The bug this pins: the banner is rendered outside the tab panel, so
     // it used to pool traffic_info across every configured stop and
     // announce a Taubstummengasse fault under the Westbahnhof tab.
-    expect(text).not.toContain("U1: Gleisschaden");
+    expect(text).not.toContain("Gleisschaden");
   });
 
   it("follows the tab the reader switches to", async () => {
@@ -377,9 +385,10 @@ describe("tab-scoped alert banner", () => {
     expect(tabs.length).toBe(2);
     tabs[1]!.click();
     await el.updateComplete;
+    expect(alertBadges(el)).toEqual(["U1"]);
     const text = shadow(el).textContent ?? "";
-    expect(text).toContain("U1: Gleisschaden");
-    expect(text).not.toContain("U3: Verspätungen");
+    expect(text).toContain("Gleisschaden");
+    expect(text).not.toContain("Verspätungen");
   });
 
   it("badges a line-less stop notice with its inferred lines", async () => {
@@ -416,9 +425,10 @@ describe("tab-scoped alert banner", () => {
       ...tabsConfig,
       layout: "stacked",
     });
+    expect(alertBadges(el)).toEqual(["U3", "U1"]);
     const text = shadow(el).textContent ?? "";
-    expect(text).toContain("U3: Verspätungen");
-    expect(text).toContain("U1: Gleisschaden");
+    expect(text).toContain("Verspätungen");
+    expect(text).toContain("Gleisschaden");
   });
 });
 
