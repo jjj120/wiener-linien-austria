@@ -29,6 +29,7 @@ from custom_components.wiener_linien_austria.const import (
     LINE_TYPE_S_BAHN,
     MAX_STOPS_AHEAD,
     ROUTING_DEPARTURE_ENDPOINT,
+    TIMETABLE_DEPARTURES_REQUESTED,
     TIMETABLE_MAX_AGE,
 )
 from custom_components.wiener_linien_austria.coordinator import (
@@ -291,15 +292,18 @@ async def test_board_refresh_policy(
     assert board.is_due(now)
 
     # A full answer: as many trains as asked for, so the server may have
-    # more. The fixture's 12, padded with copies of its first train.
+    # more. The fixture's 12, padded with copies of its first train. The
+    # copies sit at FIRST_TRAIN, so they are behind every `now` below and
+    # never count towards the running-low rule.
     full = _body()
-    full["departureList"] += [full["departureList"][0]] * 18
+    padding = TIMETABLE_DEPARTURES_REQUESTED - len(full["departureList"])
+    full["departureList"] += [full["departureList"][0]] * padding
     with (
         patch(_COOLDOWN, new_callable=AsyncMock),
         patch(_FETCH, new_callable=AsyncMock, return_value=full),
     ):
         assert await board.async_refresh() is True
-    assert len(board.departures) == 30
+    assert len(board.departures) == TIMETABLE_DEPARTURES_REQUESTED
     assert board.fetched_at is not None
 
     # Fresh and plenty ahead.
