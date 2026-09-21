@@ -1422,7 +1422,8 @@ describe("editor", () => {
       schema: Array<{ name: string; required?: boolean }>;
     };
     expect(form.schema.map((f) => f.name)).toEqual([
-      "entity", "title", "from", "to", "alternatives", "step_free", "show_map_pins", "hide_attribution",
+      "entity", "title", "from", "to", "alternatives", "step_free", "replan_from_change",
+      "show_map_pins", "hide_attribution",
     ]);
     expect(form.schema[0]?.required).toBeUndefined();
 
@@ -1501,7 +1502,7 @@ describe("searching again from a change", () => {
   ) {
     remember(WESTBAHNHOF, PRATERSTERN);
     const { h, callWS } = adhocHass(async () => ({ ...PLAN, trips }));
-    const el = await mount(h, {});
+    const el = await mount(h, { replan_from_change: true });
     await settle(el);
     return { el, callWS };
   }
@@ -1571,7 +1572,15 @@ describe("searching again from a change", () => {
   it("leaves the chip off a change the disclosure would have nothing to add to", async () => {
     remember(WESTBAHNHOF, PRATERSTERN);
     const { h } = adhocHass(async () => ({ ...PLAN, trips: [trackableChange()] }));
-    const el = await mount(h, { alternatives: 0 });
+    const el = await mount(h, { alternatives: 0, replan_from_change: true });
+    await settle(el);
+    expect(chip(el)).toBeNull();
+  });
+
+  it("stays off until the dashboard asks for it", async () => {
+    remember(WESTBAHNHOF, PRATERSTERN);
+    const { h } = adhocHass(async () => ({ ...PLAN, trips: [trackableChange()] }));
+    const el = await mount(h, {});
     await settle(el);
     expect(chip(el)).toBeNull();
   });
@@ -1587,6 +1596,7 @@ describe("searching again from a change", () => {
   it("leaves the chip off a card bound to a route entity", async () => {
     const el = await mount(hass("2026-09-14T05:50:00+00:00", { ...ACTIVE, trips: [trackableChange()] }), {
       entity: ENTITY,
+      replan_from_change: true,
     });
     expect(chip(el)).toBeNull();
   });

@@ -86,8 +86,12 @@ describe("normaliseRouteConfig", () => {
       hide_attribution: false,
       step_free: false,
       show_map_pins: true,
+      replan_from_change: false,
     });
     expect(normaliseRouteConfig({ type: "x", show_map_pins: false }).show_map_pins).toBe(false);
+    expect(
+      normaliseRouteConfig({ type: "x", replan_from_change: true }).replan_from_change,
+    ).toBe(true);
     expect(normaliseRouteConfig({ type: "x", alternatives: -1 }).alternatives).toBe(0);
     expect(normaliseRouteConfig({ type: "x", alternatives: "no" as never }).alternatives).toBe(2);
   });

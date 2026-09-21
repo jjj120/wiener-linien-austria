@@ -33,6 +33,7 @@ const ROUTE_VALIDATED_KEYS: ReadonlySet<string> = new Set([
   "hide_attribution",
   "step_free",
   "show_map_pins",
+  "replan_from_change",
 ]);
 export const MAX_ALTERNATIVES = 3;
 
@@ -68,6 +69,10 @@ export interface NormalisedRouteConfig {
   step_free: boolean;
   /** The map pin after each boarding stop and the destination. */
   show_map_pins: boolean;
+  /** Ad-hoc only: offer to search onward again from each change. Off by
+   *  default — it is an extra affordance on every change of every trip, and
+   *  a strand reads better without one until someone wants it. */
+  replan_from_change: boolean;
 }
 
 /** Validate + default a route card config. Throws the messages Lovelace shows
@@ -103,6 +108,7 @@ export function normaliseRouteConfig(
     hide_attribution: config.hide_attribution === true,
     step_free: config.step_free === true,
     show_map_pins: config.show_map_pins !== false,
+    replan_from_change: config.replan_from_change === true,
   };
 }
 

@@ -334,6 +334,7 @@ Picking stops without a route:
 - **Swap** start and destination with one tap.
 - The connections appear as soon as both stops are set.
 - **Now, Depart at or Arrive by** *(2.0.0)* — plan for right now, or pick a date and time to leave at or arrive by. Times are Vienna time, like the signs at the stop. The card starts at **Now** again after a reload.
+- **Search again from a change** *(2.1.0)* — with `replan_from_change` on, each change gets a button that looks up what else goes onward from that station, timed for when you'd actually get there. Worth turning on if your changes are often tight: the planner keeps one onward ride per connection, so the other ways out of that stop never reach the card until you ask. One tap goes back to the journey you entered.
 - The card remembers your last pick on each device. In the card editor you can also preselect a start and destination.
 
 Add via Dashboard → **Add card** → "Wiener Linien Austria — Route".
@@ -364,6 +365,7 @@ to: "60200421"
 | `show_map_pins` | `true` | Shows the map pins after the stop names. |
 | `hide_attribution` | `false` | Hides the data-source line. |
 | `step_free` | `false` | Plans step-free connections when there's no `entity`. A route uses its own **Step-free** setting. |
+| `replan_from_change` | `false` | Adds a **Search from here** button at each change, when there's no `entity`. |
 
 **How the card plans between any two stops.** Requests go through Home Assistant, never from the browser to Wiener Linien. The card refreshes every 2 minutes while it's on screen and the browser tab is visible, and shortly after the best connection leaves. After 30 minutes without a tap or key press it pauses until someone touches it, so a wall tablet left open stops asking. Home Assistant reuses an answer for up to a minute, whichever dashboard asks. Each Home Assistant user gets up to 60 trip-planner requests an hour, and all users together up to 120.
 

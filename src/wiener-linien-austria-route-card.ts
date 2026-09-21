@@ -571,9 +571,14 @@ export class WienerLinienAustriaRouteCard extends LitElement {
    *  - It can't be the destination itself (`adhoc_same_stop`).
    */
   private _canReplanFrom(stop: RouteStopAttr): boolean {
-    // With the disclosure turned off, a jump would answer with the one
-    // connection the strand already shows and nothing behind it.
-    if (!this._isAdhoc || !this._to || !this._config?.alternatives) return false;
+    // Off by default: an affordance on every change of every trip earns its
+    // place only where someone asked for it. With the disclosure turned off a
+    // jump would answer with the one connection the strand already shows and
+    // nothing behind it, so that switch silences this one too.
+    const cfg = this._config;
+    if (!this._isAdhoc || !this._to || !cfg?.replan_from_change || !cfg.alternatives) {
+      return false;
+    }
     const diva = stop.stop_id;
     if (!diva || diva === this._to) return false;
     return this._stops?.some((option) => option.value === diva) === true;
@@ -1461,7 +1466,7 @@ export class WienerLinienAustriaRouteCard extends LitElement {
       aria-label=${this._t("replan_from_here_label", { stop: boarding.name })}
       @click=${() => this._replanFromHere(boarding, when)}
     >
-      <ha-icon icon="mdi:sign-direction" aria-hidden="true"></ha-icon>
+      <ha-icon icon="mdi:directions-fork" aria-hidden="true"></ha-icon>
       <span>${this._t("replan_from_here")}</span>
     </button>`;
   }
@@ -2053,29 +2058,31 @@ export class WienerLinienAustriaRouteCard extends LitElement {
       --mdc-icon-size: 16px;
     }
 
-    /* "Search from here" sits in the same chip run as the walk and the buffer
-       badge, but it is the only thing there anyone can press. An outline
-       instead of the risk chip's solid fill keeps that difference visible
-       without a second saturated colour fighting the grade beside it, and
-       32px clears WCAG 2.5.8's target size in a row of 0.85rem text. */
+    /* "Search from here" belongs to the strand's disclosure family — the same
+       borderless text-and-icon shape as "6 Stationen" and "Weitere
+       Verbindungen", because it does the same kind of thing. It carried a
+       border and a tint first, which made the one pressable item in the row
+       heavier than the red badge warning the change won't hold.
+
+       Pushed to the trailing edge, where it lines up with the ride meta
+       ("alle 3 min") above and below it. Three changes then put three of
+       these in one column instead of three blocks against the rail. */
     .replan {
       display: inline-flex;
       align-items: center;
       gap: 4px;
+      /* Clears WCAG 2.5.8's target size without drawing a box to do it. */
       min-height: 32px;
-      padding: 0 10px;
-      border: 1px solid color-mix(in srgb, var(--primary-color) 45%, transparent);
+      margin-inline-start: auto;
+      padding: 0 6px;
+      border: none;
       border-radius: var(--wl-radius-sm);
-      background: color-mix(in srgb, var(--primary-color) 8%, transparent);
+      background: none;
       color: var(--primary-color);
       font: inherit;
       font-size: 0.8rem;
       font-weight: 600;
-      line-height: 1;
       cursor: pointer;
-    }
-    .replan span {
-      text-box: trim-both cap alphabetic;
     }
     .replan ha-icon {
       display: block;
@@ -2087,7 +2094,7 @@ export class WienerLinienAustriaRouteCard extends LitElement {
     }
     @media (hover: hover) {
       .replan:hover:not([disabled]) {
-        background: color-mix(in srgb, var(--primary-color) 16%, transparent);
+        background: color-mix(in srgb, var(--primary-color) 12%, transparent);
       }
     }
 

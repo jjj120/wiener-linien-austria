@@ -60,7 +60,12 @@ function schema(
       },
     },
     // Toggles last, in one run.
-    ...(adhoc && stopSelector ? [{ name: "step_free", selector: { boolean: {} } }] : []),
+    ...(adhoc && stopSelector
+      ? [
+          { name: "step_free", selector: { boolean: {} } },
+          { name: "replan_from_change", selector: { boolean: {} } },
+        ]
+      : []),
     { name: "show_map_pins", selector: { boolean: {} } },
     { name: "hide_attribution", selector: { boolean: {} } },
   ] as unknown as ReadonlyArray<HaFormSchema>;
@@ -107,6 +112,7 @@ export class WienerLinienAustriaRouteCardEditor
     if (!next.title) delete next.title;
     if (next.entity || next.step_free !== true) delete next.step_free;
     if (next.show_map_pins !== false) delete next.show_map_pins;
+    if (next.entity || next.replan_from_change !== true) delete next.replan_from_change;
     if (next.hide_attribution !== true) delete next.hide_attribution;
     this._config = normaliseRouteConfig(next as WienerLinienRouteCardConfig);
     fireEvent(this, "config-changed", { config: next });
