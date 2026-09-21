@@ -20,7 +20,13 @@ import "./route-editor.js";
 
 import { ROUTE_CARD_VERSION } from "./const.js";
 import { pickerText } from "./localize/localize.js";
-import type { HomeAssistant, RouteAccessStepAttr, RouteTripAttr } from "./types.js";
+import type {
+  HomeAssistant,
+  RouteAccessStepAttr,
+  RouteLegAttr,
+  RouteTripAttr,
+} from "./types.js";
+import { ADHOC_DEBOUNCE_MS } from "./utils/route.js";
 
 const TAG = "wiener-linien-austria-route-card";
 const ENTITY = "sensor.westbahnhof_praterstern_naechste_verbindung";
@@ -1467,5 +1473,90 @@ describe("editor", () => {
     document.body.appendChild(el);
     await el.updateComplete;
     expect(root(el).querySelector("ha-form")).toBeNull();
+  });
+});
+
+describe("searching again from a change", () => {
+  const STEPHANSPLATZ = "60201012";
+
+  /** The shared fixture's change is at a stop with no `stop_id`. Give it the
+   *  DIVA the catalogue knows it by, so the chip has something to plan from. */
+  function trackableChange(): RouteTripAttr {
+    const base = trip("07:57", "08:11");
+    const [first, second] = base.legs as [RouteLegAttr, RouteLegAttr];
+    return {
+      ...base,
+      legs: [
+        { ...first, destination: { ...first.destination, stop_id: STEPHANSPLATZ } },
+        { ...second, origin: { ...second.origin, stop_id: STEPHANSPLATZ } },
+      ],
+    };
+  }
+
+  const chip = (el: CardElement): HTMLButtonElement | null =>
+    root(el).querySelector<HTMLButtonElement>(".strand .replan");
+
+  async function jumped(trips: RouteTripAttr[] = [trackableChange()]) {
+    remember(WESTBAHNHOF, PRATERSTERN);
+    const { h, callWS } = adhocHass(async () => ({ ...PLAN, trips }));
+    const el = await mount(h, {});
+    await settle(el);
+    return { el, callWS };
+  }
+
+  it("plans from the change to the same destination, for the minute you get in", async () => {
+    const { el, callWS } = await jumped();
+    const button = chip(el)!;
+    expect(button.getAttribute("aria-label")).toBe(
+      "Andere Verbindung ab Stephansplatz suchen",
+    );
+
+    button.click();
+    await settle(el, ADHOC_DEBOUNCE_MS);
+
+    // Arrival 08:04 plus the 4 min between platforms — not "now" (07:50),
+    // which would answer for a station nobody has reached yet.
+    expect(planCalls(callWS).at(-1)).toMatchObject({
+      origin: Number(STEPHANSPLATZ),
+      destination: Number(PRATERSTERN),
+      datetime: "2026-09-14T08:08",
+      arrive_by: false,
+    });
+  });
+
+  it("offers the way back and does not rewrite the saved journey", async () => {
+    const { el, callWS } = await jumped();
+    chip(el)!.click();
+    await settle(el, ADHOC_DEBOUNCE_MS);
+
+    // The dashboard still opens on the journey that was actually entered.
+    expect(JSON.parse(window.localStorage.getItem("wiener-linien-austria-route-adhoc")!)).toEqual({
+      from: WESTBAHNHOF,
+      to: PRATERSTERN,
+    });
+
+    const back = root(el).querySelector<HTMLButtonElement>(".replan-back")!;
+    expect(back.textContent).toContain("Zurück zu Westbahnhof");
+
+    back.click();
+    await settle(el, ADHOC_DEBOUNCE_MS);
+    expect(planCalls(callWS).at(-1)).toMatchObject({ origin: Number(WESTBAHNHOF) });
+    expect(planCalls(callWS).at(-1)).not.toHaveProperty("datetime");
+    expect(root(el).querySelector(".replan-back")).toBeNull();
+  });
+
+  it("leaves the chip off a change the catalogue doesn't track", async () => {
+    // The shared fixture's Stephansplatz carries no `stop_id` — an S-Bahn-only
+    // station or a stop past the city border looks the same, and the backend
+    // would answer `adhoc_invalid_stop`.
+    const { el } = await jumped([trip("07:57", "08:11")]);
+    expect(chip(el)).toBeNull();
+  });
+
+  it("leaves the chip off a card bound to a route entity", async () => {
+    const el = await mount(hass("2026-09-14T05:50:00+00:00", { ...ACTIVE, trips: [trackableChange()] }), {
+      entity: ENTITY,
+    });
+    expect(chip(el)).toBeNull();
   });
 });

@@ -72,6 +72,7 @@ import {
   isInputDateTime,
   legTypeIcon,
   loadAdhocSelection,
+  replanDeparture,
   rideFrequency,
   rideKey,
   tripKey,
@@ -100,6 +101,18 @@ const TICK_MS = 15_000;
 const MAX_NOTICES = 2;
 
 type AdhocPhase = "idle" | "loading" | "ready" | "error" | "paused";
+
+/** The query a "search from here" jump replaced, so the way back is one tap.
+ *  `to` is not in here on purpose: the jump only ever moves the origin, and
+ *  keeping a second copy of the destination would be a second thing to keep
+ *  in step with the picker. */
+interface ReplanOrigin {
+  from: string;
+  timeMode: AdhocTimeMode;
+  when: string;
+  /** What to call the stop we came from, for the button that goes back. */
+  name: string;
+}
 
 /** A backend error as the card keeps it: the WebSocket code, how long the
  *  backend asked to wait, and its translation key where the code alone
@@ -171,6 +184,7 @@ export class WienerLinienAustriaRouteCard extends LitElement {
   @state() private _timeMode: AdhocTimeMode = "now";
   @state() private _when = "";
   @state() private _plan: RouteAttrs | null = null;
+  @state() private _replanFrom: ReplanOrigin | null = null;
   @state() private _phase: AdhocPhase = "idle";
   @state() private _error: AdhocError | null = null;
   @state() private _announcement = "";
@@ -488,6 +502,7 @@ export class WienerLinienAustriaRouteCard extends LitElement {
     const next = typeof value === "string" || typeof value === "number" ? String(value) : "";
     if (which === "from") this._from = next;
     else this._to = next;
+    this._replanFrom = null;
     saveAdhocSelection({ from: this._from, to: this._to });
     this._lastInteraction = Date.now();
     this._requestPlan(true);
@@ -522,11 +537,84 @@ export class WienerLinienAustriaRouteCard extends LitElement {
 
   private _swap = (): void => {
     [this._from, this._to] = [this._to, this._from];
+    this._replanFrom = null;
     saveAdhocSelection({ from: this._from, to: this._to });
     this._lastInteraction = Date.now();
     this._requestPlan(true);
   };
 
+
+  // ------------------------------------------------------------------
+  // Ad-hoc mode: searching again from a change
+  // ------------------------------------------------------------------
+
+  /** Whether this stop can stand in as an origin. Three things have to hold,
+   *  and the backend would answer an error for each of them:
+   *
+   *  - It has to be a stop the catalogue tracks. `stop_id` is the DIVA the
+   *    plan command takes, but the strand also names stops the catalogue
+   *    doesn't hold — an S-Bahn-only station, a Badner Bahn stop past the
+   *    city border — and those come back as `adhoc_invalid_stop`. The picker
+   *    list is the same set the backend accepts, so it is the gate.
+   *  - It can't be the destination itself (`adhoc_same_stop`).
+   */
+  private _canReplanFrom(stop: RouteStopAttr): boolean {
+    if (!this._isAdhoc || !this._to) return false;
+    const diva = stop.stop_id;
+    if (!diva || diva === this._to) return false;
+    return this._stops?.some((option) => option.value === diva) === true;
+  }
+
+  /** The origin the current plan was asked for, named the way the strand
+   *  names it. `legs[0]` rather than the first ride: a trip that starts with
+   *  a walk boards somewhere else, and the button back has to offer the stop
+   *  that was searched for, not the one the first tram leaves from. */
+  private _originName(): string {
+    const trip = this._plan ? upcomingTrips(this._plan, this._now)[0] : undefined;
+    return trip?.legs[0]?.origin.name ?? "";
+  }
+
+  /** Plan the rest of the journey again from a change, for the minute someone
+   *  standing there could actually board.
+   *
+   *  Planning it for "now" would be the wrong question and a convincing wrong
+   *  answer: from the sofa, half an hour before leaving, it would list trains
+   *  out of a station nobody has reached yet. The destination is left alone —
+   *  this only asks "what else goes from here", never where to.
+   *
+   *  Deliberately not written to the saved selection: a look at one change is
+   *  not a change of the journey this dashboard opens on. */
+  private _replanFromHere(stop: RouteStopAttr, when: string): void {
+    const diva = stop.stop_id;
+    if (!diva) return;
+    // Only the first jump records the way back. Hopping from change to change
+    // should still return to where the journey was actually asked about.
+    this._replanFrom ??= {
+      from: this._from,
+      timeMode: this._timeMode,
+      when: this._when,
+      name: this._originName(),
+    };
+    this._from = diva;
+    this._timeMode = "depart";
+    this._when = when;
+    this._lastInteraction = Date.now();
+    // The plan's own announcement follows a second later; this one covers the
+    // debounce and the request, where the card would otherwise sit silent.
+    this._announce(this._t("replan_announce", { stop: stop.name }));
+    this._requestPlan(true);
+  }
+
+  private _backToOrigin = (): void => {
+    const origin = this._replanFrom;
+    if (!origin) return;
+    this._replanFrom = null;
+    this._from = origin.from;
+    this._timeMode = origin.timeMode;
+    this._when = origin.when;
+    this._lastInteraction = Date.now();
+    this._requestPlan(true);
+  };
 
   /** Re-setting identical text wouldn't be announced, so nudge it. */
   private _announce(text: string): void {
@@ -755,9 +843,10 @@ export class WienerLinienAustriaRouteCard extends LitElement {
         false,
       );
     }
+    const back = this._renderReplanBack();
     if (this._phase === "error" && this._error) {
       const { icon, title, detail } = this._adhocError(this._error);
-      return this._empty(icon, title, detail, false);
+      return html`${back}${this._empty(icon, title, detail, false)}`;
     }
     const paused =
       this._phase === "paused"
@@ -770,8 +859,8 @@ export class WienerLinienAustriaRouteCard extends LitElement {
     const plan = this._plan;
     if (!plan) {
       return this._phase === "paused"
-        ? html`${paused}`
-        : this._empty("mdi:timer-sand", this._t("adhoc_loading"), undefined, false);
+        ? html`${back}${paused}`
+        : html`${back}${this._empty("mdi:timer-sand", this._t("adhoc_loading"), undefined, false)}`;
     }
     // Budget spent: the plan on screen is older than usual. The header's
     // "Zuletzt aktualisiert" already says how old; this says why.
@@ -784,14 +873,14 @@ export class WienerLinienAustriaRouteCard extends LitElement {
         : nothing;
     const trips = upcomingTrips(plan, this._now);
     if (!trips[0]) {
-      return html`${paused}${stale}${this._empty(
+      return html`${back}${paused}${stale}${this._empty(
         "mdi:timetable",
         this._t("adhoc_no_trips"),
         this._t("adhoc_no_trips_detail"),
         false,
       )}`;
     }
-    return html`${paused}${stale}${this._renderTrips(trips, plan, cfg)}`;
+    return html`${back}${paused}${stale}${this._renderTrips(trips, plan, cfg)}`;
   }
 
   // ------------------------------------------------------------------
@@ -1080,7 +1169,13 @@ export class WienerLinienAustriaRouteCard extends LitElement {
               scope,
             )}
             ${transfer && i < legs.length - 1
-              ? this._renderTransfer(transfer, attrs, catchableDeparture(leg, transfer, legs[i + 1]!))
+              ? this._renderTransfer(
+                  transfer,
+                  attrs,
+                  catchableDeparture(leg, transfer, legs[i + 1]!),
+                  leg.destination,
+                  legs[i + 1]!.origin,
+                )
               : nothing}
           `;
         })}
@@ -1300,6 +1395,8 @@ export class WienerLinienAustriaRouteCard extends LitElement {
     transfer: RouteTransferAttr,
     attrs: RouteAttrs,
     catchable: string | null = null,
+    arrival?: RouteStopAttr,
+    boarding?: RouteStopAttr,
   ): TemplateResult {
     return html`
       <li class="transfer" data-risk=${transfer.risk}>
@@ -1318,8 +1415,51 @@ export class WienerLinienAustriaRouteCard extends LitElement {
               ${this._t("next_catchable", { time: roundedClock(catchable) })}
             </span>`
           : nothing}
+        ${this._renderReplan(transfer, arrival, boarding)}
       </li>
     `;
+  }
+
+  /** "Search from here" on a change: the buffer badge above it says the
+   *  connection is tight, and until now the card said nothing about what to
+   *  do about it. This asks the planner the obvious follow-up — what else
+   *  leaves this station for where I'm going — without making anyone retype
+   *  a journey they already entered.
+   *
+   *  Ad-hoc mode only. A card bound to a route entity is showing that route's
+   *  sensor, and there is no query of its own to redirect. */
+  private _renderReplan(
+    transfer: RouteTransferAttr,
+    arrival: RouteStopAttr | undefined,
+    boarding: RouteStopAttr | undefined,
+  ): TemplateResult | typeof nothing {
+    if (!arrival || !boarding) return nothing;
+    // A change with no usable arrival time can't be planned from: the query
+    // would fall back to "now" and answer for a station nobody has reached.
+    const when = replanDeparture(arrival, transfer.walk_minutes, this._now);
+    if (when === null || !this._canReplanFrom(boarding)) return nothing;
+    return html`<button
+      type="button"
+      class="replan"
+      ?disabled=${this._phase === "loading"}
+      aria-label=${this._t("replan_from_here_label", { stop: boarding.name })}
+      @click=${() => this._replanFromHere(boarding, when)}
+    >
+      <ha-icon icon="mdi:sign-direction" aria-hidden="true"></ha-icon>
+      <span>${this._t("replan_from_here")}</span>
+    </button>`;
+  }
+
+  /** The way back after a jump. The From picker already shows the change as
+   *  the new origin, so this only has to undo it — including the time, which
+   *  the jump moved to the arrival at that change. */
+  private _renderReplanBack(): TemplateResult | typeof nothing {
+    const origin = this._replanFrom;
+    if (!origin) return nothing;
+    return html`<button type="button" class="replan-back" @click=${this._backToOrigin}>
+      <ha-icon icon="mdi:arrow-u-left-top" aria-hidden="true"></ha-icon>
+      <span>${this._t("replan_back", { stop: origin.name })}</span>
+    </button>`;
   }
 
   private _renderAlternatives(trips: RouteTripAttr[], attrs: RouteAttrs): TemplateResult {
@@ -1895,6 +2035,68 @@ export class WienerLinienAustriaRouteCard extends LitElement {
     }
     .walk ha-icon {
       --mdc-icon-size: 16px;
+    }
+
+    /* "Search from here" sits in the same chip run as the walk and the buffer
+       badge, but it is the only thing there anyone can press. An outline
+       instead of the risk chip's solid fill keeps that difference visible
+       without a second saturated colour fighting the grade beside it, and
+       32px clears WCAG 2.5.8's target size in a row of 0.85rem text. */
+    .replan {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      min-height: 32px;
+      padding: 0 10px;
+      border: 1px solid color-mix(in srgb, var(--primary-color) 45%, transparent);
+      border-radius: var(--wl-radius-sm);
+      background: color-mix(in srgb, var(--primary-color) 8%, transparent);
+      color: var(--primary-color);
+      font: inherit;
+      font-size: 0.8rem;
+      font-weight: 600;
+      line-height: 1;
+      cursor: pointer;
+    }
+    .replan span {
+      text-box: trim-both cap alphabetic;
+    }
+    .replan ha-icon {
+      display: block;
+      --mdc-icon-size: 16px;
+    }
+    .replan[disabled] {
+      opacity: 0.5;
+      cursor: default;
+    }
+    @media (hover: hover) {
+      .replan:hover:not([disabled]) {
+        background: color-mix(in srgb, var(--primary-color) 16%, transparent);
+      }
+    }
+
+    /* The way back out of a jump. Above the connection rather than beside the
+       pickers: the From field already shows where we ended up, so this is a
+       property of the answer on screen, not of the form. */
+    .replan-back {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      min-height: 36px;
+      margin-block-end: 4px;
+      padding: 0 10px 0 6px;
+      border: none;
+      border-radius: var(--wl-radius-md);
+      background: var(--secondary-background-color, rgb(127 127 127 / 0.12));
+      color: var(--primary-text-color);
+      font: inherit;
+      font-size: 0.85rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .replan-back ha-icon {
+      --mdc-icon-size: 18px;
+      color: var(--primary-color);
     }
     .stop--end {
       display: flex;

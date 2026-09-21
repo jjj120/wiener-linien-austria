@@ -411,6 +411,36 @@ export function viennaInputValue(nowMs: number): string {
   return `${p["year"]}-${p["month"]}-${p["day"]}T${p["hour"]}:${p["minute"]}`;
 }
 
+/** A `datetime-local` value for one exact instant on the Vienna clock, with
+ *  no rounding. `viennaInputValue` rounds up to the next five minutes, which
+ *  is right for "pick a time" but wrong for "plan from the minute this ride
+ *  gets in": that would push the query up to five minutes past the arrival
+ *  and hide the connections leaving in between. */
+export function viennaInputAt(ms: number): string {
+  const p = viennaParts(ms);
+  return `${p["year"]}-${p["month"]}-${p["day"]}T${p["hour"]}:${p["minute"]}`;
+}
+
+/** When someone standing at a change could realistically board again: the
+ *  ride's arrival there plus the walk between the two platforms. Live time
+ *  where there is one, so a late arrival moves the question with it.
+ *
+ *  Null when the arrival has no usable time — the trip is then still drawn,
+ *  it just can't be re-planned from, since a plan for "now" would offer
+ *  departures from a station nobody has reached yet.
+ */
+export function replanDeparture(
+  arrival: RouteStopAttr,
+  walkMinutes: number,
+  nowMs: number,
+): string | null {
+  const ts = Date.parse(arrival.estimated ?? arrival.planned ?? "");
+  if (!Number.isFinite(ts)) return null;
+  // A change already behind us is a plan for now, not for a past minute:
+  // the upstream would answer with that morning's departures.
+  return viennaInputAt(Math.max(ts + Math.max(walkMinutes, 0) * 60_000, nowMs));
+}
+
 /** A well-formed `datetime-local` value, as the plan command accepts it. */
 export function isInputDateTime(value: string): boolean {
   return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(value);

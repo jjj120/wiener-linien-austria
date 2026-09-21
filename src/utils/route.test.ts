@@ -24,6 +24,7 @@ import {
   viennaClock,
   viennaDayOffset,
   viennaInputValue,
+  replanDeparture,
   ADHOC_PLANNED_REFRESH_MS,
   rideFrequency,
   roundedClock,
@@ -301,6 +302,27 @@ describe("chosen-time planning", () => {
     expect(viennaInputValue(Date.parse("2026-09-14T07:55:00+02:00"))).toBe("2026-09-14T07:55");
     // Rolls over midnight in Vienna, not in UTC.
     expect(viennaInputValue(Date.parse("2026-09-14T21:58:00Z"))).toBe("2026-09-15T00:00");
+  });
+
+  it("plans from a change at the minute the ride gets in, plus the walk", () => {
+    const stop = (planned: string, estimated: string | null = null) => ({
+      name: "Stephansplatz",
+      stop_id: "60201012",
+      platform: null,
+      planned,
+      estimated,
+      delay_minutes: null,
+    });
+    // 08:04 arrival + 4 min between platforms, and not rounded up to 08:10 —
+    // that would hide whatever leaves at 08:09.
+    expect(replanDeparture(stop("2026-09-14T08:04:00+02:00"), 4, NOW)).toBe("2026-09-14T08:08");
+    // A late ride moves the question with it.
+    expect(
+      replanDeparture(stop("2026-09-14T08:04:00+02:00", "2026-09-14T08:11:00+02:00"), 4, NOW),
+    ).toBe("2026-09-14T08:15");
+    // A change already behind us asks for now, not for this morning.
+    expect(replanDeparture(stop("2026-09-14T06:00:00+02:00"), 0, NOW)).toBe("2026-09-14T07:50");
+    expect(replanDeparture(stop(""), 4, NOW)).toBeNull();
   });
 
   it("accepts only a complete datetime-local value", () => {
