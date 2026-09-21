@@ -68,6 +68,19 @@ def _body() -> dict[str, Any]:
     return json.loads(FIXTURE.read_text(encoding="utf-8"))
 
 
+def _padded_body(rows: int) -> dict[str, Any]:
+    """The fixture's 12 trains padded to `rows` with copies of its first one.
+
+    The copies all sit at FIRST_TRAIN, so any `now` past that counts none
+    of them as upcoming: a long batch that is nearly spent, which is the
+    state the running-low rule exists to catch.
+    """
+    body = _body()
+    deps = body["departureList"]
+    body["departureList"] = deps + [deps[0]] * (rows - len(deps))
+    return body
+
+
 def _planned(
     line: str = "S1",
     direction: str = "R",
@@ -292,12 +305,8 @@ async def test_board_refresh_policy(
     assert board.is_due(now)
 
     # A full answer: as many trains as asked for, so the server may have
-    # more. The fixture's 12, padded with copies of its first train. The
-    # copies sit at FIRST_TRAIN, so they are behind every `now` below and
-    # never count towards the running-low rule.
-    full = _body()
-    padding = TIMETABLE_DEPARTURES_REQUESTED - len(full["departureList"])
-    full["departureList"] += [full["departureList"][0]] * padding
+    # more.
+    full = _padded_body(TIMETABLE_DEPARTURES_REQUESTED)
     with (
         patch(_COOLDOWN, new_callable=AsyncMock),
         patch(_FETCH, new_callable=AsyncMock, return_value=full),
@@ -784,6 +793,65 @@ async def test_short_answer_is_complete_and_not_refetched_early(
     assert not board.is_due(fetched + timedelta(minutes=30))
     assert not board.is_due(fetched + TIMETABLE_MAX_AGE - timedelta(minutes=1))
     assert board.is_due(fetched + TIMETABLE_MAX_AGE)
+
+
+@pytest.mark.parametrize(
+    ("rows", "complete", "due"),
+    [
+        (TIMETABLE_DEPARTURES_REQUESTED, False, True),
+        (TIMETABLE_DEPARTURES_REQUESTED - 1, True, False),
+    ],
+    ids=["full batch", "one short"],
+)
+async def test_complete_guard_gates_the_running_low_rule(
+    hass: HomeAssistant, rows: int, complete: bool, due: bool
+) -> None:
+    """One row short of the ask turns the running-low rule off.
+
+    Both batches are nearly spent — four trains still ahead, under
+    TIMETABLE_MIN_UPCOMING — so the only thing separating them is whether
+    the server cut the answer at the requested size. A full one may have
+    more behind it and is worth refetching; a short one was everything the
+    server had, and asking again in five minutes would not add a train.
+    """
+    board = TimetableBoard(hass, PRATERSTERN)
+    with (
+        patch(_COOLDOWN, new_callable=AsyncMock),
+        patch(_FETCH, new_callable=AsyncMock, return_value=_padded_body(rows)),
+    ):
+        assert await board.async_refresh() is True
+    assert len(board.departures) == rows
+    assert board._complete is complete
+
+    # Past the retry spacing and well inside TIMETABLE_MAX_AGE, so the
+    # running-low rule is the only thing left that can answer.
+    board._fetched_at = FIRST_TRAIN + timedelta(minutes=60)
+    board._attempted_at = board._fetched_at
+    now = FIRST_TRAIN + timedelta(minutes=66)
+    assert sum(1 for dep in board.departures if dep.planned >= now) == 4
+    assert board.is_due(now) is due
+    # The age rule outranks the guard either way.
+    assert board.is_due(board._fetched_at + TIMETABLE_MAX_AGE)
+
+
+async def test_refresh_asks_for_the_size_the_complete_guard_compares_against(
+    hass: HomeAssistant,
+) -> None:
+    """The request's `limit` is the number `_complete` is measured against.
+
+    `_complete` reads "the server gave everything it had" out of
+    `len(answer) < TIMETABLE_DEPARTURES_REQUESTED`, which only says that
+    while the same constant is what the request asked for. Were the two to
+    drift, the board would be pinned to one branch of `is_due` forever:
+    a smaller ask never fills, so the running-low rule would be dead; a
+    larger one always fills, so it would fire on every spent batch.
+    """
+    board = TimetableBoard(hass, PRATERSTERN)
+    fetch = AsyncMock(return_value=_body())
+    with patch(_COOLDOWN, new_callable=AsyncMock), patch(_FETCH, fetch):
+        await board.async_refresh()
+    params = dict(fetch.await_args.args[1])
+    assert params["limit"] == str(TIMETABLE_DEPARTURES_REQUESTED)
 
 
 async def test_refresh_does_not_hide_a_monitor_failure(hass: HomeAssistant) -> None:
