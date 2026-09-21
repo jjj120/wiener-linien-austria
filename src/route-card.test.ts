@@ -26,7 +26,7 @@ import type {
   RouteLegAttr,
   RouteTripAttr,
 } from "./types.js";
-import { ADHOC_DEBOUNCE_MS } from "./utils/route.js";
+import { ADHOC_DEBOUNCE_MS, ADHOC_REFRESH_MS } from "./utils/route.js";
 
 const TAG = "wiener-linien-austria-route-card";
 const ENTITY = "sensor.westbahnhof_praterstern_naechste_verbindung";
@@ -1496,7 +1496,9 @@ describe("searching again from a change", () => {
   const chip = (el: CardElement): HTMLButtonElement | null =>
     root(el).querySelector<HTMLButtonElement>(".strand .replan");
 
-  async function jumped(trips: RouteTripAttr[] = [trackableChange()]) {
+  async function jumped(
+    trips: RouteTripAttr[] = [trackableChange(), trip("08:00", "08:16", "ok")],
+  ) {
     remember(WESTBAHNHOF, PRATERSTERN);
     const { h, callWS } = adhocHass(async () => ({ ...PLAN, trips }));
     const el = await mount(h, {});
@@ -1543,6 +1545,35 @@ describe("searching again from a change", () => {
     expect(planCalls(callWS).at(-1)).toMatchObject({ origin: Number(WESTBAHNHOF) });
     expect(planCalls(callWS).at(-1)).not.toHaveProperty("datetime");
     expect(root(el).querySelector(".replan-back")).toBeNull();
+  });
+
+  it("lands with the alternatives open — they are the whole point", async () => {
+    const { el, callWS } = await jumped();
+    const list = () => root(el).querySelector<HTMLElement>(".alt-list");
+    // The end-to-end query hides onward options the sub-query restores, so
+    // arriving on a collapsed disclosure would answer with what was known.
+    expect(list()!.hasAttribute("hidden")).toBe(true);
+
+    chip(el)!.click();
+    await settle(el, ADHOC_DEBOUNCE_MS);
+    expect(list()!.hasAttribute("hidden")).toBe(false);
+
+    // One-shot: a later refresh must not re-open a list since collapsed.
+    root(el).querySelector<HTMLButtonElement>(".alt-toggle")!.click();
+    await settle(el);
+    expect(list()!.hasAttribute("hidden")).toBe(true);
+    const before = planCalls(callWS).length;
+    await settle(el, ADHOC_REFRESH_MS);
+    expect(planCalls(callWS).length).toBeGreaterThan(before);
+    expect(list()!.hasAttribute("hidden")).toBe(true);
+  });
+
+  it("leaves the chip off a change the disclosure would have nothing to add to", async () => {
+    remember(WESTBAHNHOF, PRATERSTERN);
+    const { h } = adhocHass(async () => ({ ...PLAN, trips: [trackableChange()] }));
+    const el = await mount(h, { alternatives: 0 });
+    await settle(el);
+    expect(chip(el)).toBeNull();
   });
 
   it("leaves the chip off a change the catalogue doesn't track", async () => {

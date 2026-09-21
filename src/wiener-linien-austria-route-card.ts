@@ -194,6 +194,11 @@ export class WienerLinienAustriaRouteCard extends LitElement {
   private _adhocStarted = false;
   private _planKey = "";
   private _planSeq = 0;
+  /** A jump's point is the connections the end-to-end query filtered out, so
+   *  its answer arrives with the disclosure already open. One-shot, not tied
+   *  to `_replanFrom`: a refresh two minutes later must not re-open a list
+   *  the person has since collapsed. */
+  private _revealAlternatives = false;
   private _refreshTimer: ReturnType<typeof setTimeout> | null = null;
   /** When the scheduled refresh is due (epoch ms). Survives a disconnect, so
    *  a card HA re-attaches on a view switch waits out the rest instead of
@@ -478,12 +483,17 @@ export class WienerLinienAustriaRouteCard extends LitElement {
       this._planKey = key;
       this._error = null;
       this._phase = "ready";
+      if (this._revealAlternatives) {
+        this._alternativesOpen = true;
+        this._revealAlternatives = false;
+      }
       if (userInitiated) this._announce(this._planAnnouncement(plan));
       this._schedule(adhocPlanRefreshDelay(plan, Date.now()));
     } catch (err) {
       if (seq !== this._planSeq) return;
       const error = adhocErrorOf(err);
       this._error = error;
+      this._revealAlternatives = false;
       // A stale plan through an outage reads as "these still run"; show the
       // problem instead, as the route sensor does when it goes unavailable.
       this._plan = null;
@@ -503,6 +513,7 @@ export class WienerLinienAustriaRouteCard extends LitElement {
     if (which === "from") this._from = next;
     else this._to = next;
     this._replanFrom = null;
+    this._revealAlternatives = false;
     saveAdhocSelection({ from: this._from, to: this._to });
     this._lastInteraction = Date.now();
     this._requestPlan(true);
@@ -538,6 +549,7 @@ export class WienerLinienAustriaRouteCard extends LitElement {
   private _swap = (): void => {
     [this._from, this._to] = [this._to, this._from];
     this._replanFrom = null;
+    this._revealAlternatives = false;
     saveAdhocSelection({ from: this._from, to: this._to });
     this._lastInteraction = Date.now();
     this._requestPlan(true);
@@ -559,7 +571,9 @@ export class WienerLinienAustriaRouteCard extends LitElement {
    *  - It can't be the destination itself (`adhoc_same_stop`).
    */
   private _canReplanFrom(stop: RouteStopAttr): boolean {
-    if (!this._isAdhoc || !this._to) return false;
+    // With the disclosure turned off, a jump would answer with the one
+    // connection the strand already shows and nothing behind it.
+    if (!this._isAdhoc || !this._to || !this._config?.alternatives) return false;
     const diva = stop.stop_id;
     if (!diva || diva === this._to) return false;
     return this._stops?.some((option) => option.value === diva) === true;
@@ -596,6 +610,7 @@ export class WienerLinienAustriaRouteCard extends LitElement {
       name: this._originName(),
     };
     this._from = diva;
+    this._revealAlternatives = true;
     this._timeMode = "depart";
     this._when = when;
     this._lastInteraction = Date.now();
@@ -609,6 +624,7 @@ export class WienerLinienAustriaRouteCard extends LitElement {
     const origin = this._replanFrom;
     if (!origin) return;
     this._replanFrom = null;
+    this._revealAlternatives = false;
     this._from = origin.from;
     this._timeMode = origin.timeMode;
     this._when = origin.when;
