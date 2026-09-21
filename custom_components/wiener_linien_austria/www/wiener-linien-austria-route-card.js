@@ -299,13 +299,14 @@ const Pe={ATTRIBUTE:1,CHILD:2,PROPERTY:3,BOOLEAN_ATTRIBUTE:4,EVENT:5,ELEMENT:6},
           <p class="hero-sub">${t}</p>
         </div>
       </div>
-    `}_renderNotices(e,t){let n=new Set(J(e).map(e=>e.line??``)),r=this._liftOutages(e,t).map(e=>({title:this._t(`lift_out_notice`,{station:e.station??``})})),i=[...r,...(t.traffic_info??[]).filter(e=>(e.related_lines??[]).some(e=>n.has(e)))].slice(0,2+r.length);return i.length?D`
+    `}_renderNotices(e,t){let n=new Set(J(e).map(e=>e.line??``)),r=this._liftOutages(e,t).map(e=>({title:this._t(`lift_out_notice`,{station:e.station??``}),detail:[e.description,e.reason].map(e=>(e??``).trim()).filter(Boolean).join(` · `)})),i=[...r,...(t.traffic_info??[]).filter(e=>(e.related_lines??[]).some(e=>n.has(e))).map(e=>({title:e.title,detail:``}))].slice(0,2+r.length);return i.length?D`
       <ul class="notices">
         ${i.map(e=>D`
             <li class="notice">
               <ha-icon icon="mdi:alert-outline" aria-hidden="true"></ha-icon>
               <span>
                 <span class="sr-only">${this._t(`disruption`)}: </span>${e.title??``}
+                ${e.detail?D`<span class="notice-detail">${e.detail}</span>`:k}
               </span>
             </li>
           `)}
@@ -941,6 +942,12 @@ font-size: 0.85rem;
 .notice ha-icon {
 --mdc-icon-size: 18px;
 flex: none;
+}
+.notice-detail {
+display: block;
+margin-top: 2px;
+font-size: 0.8rem;
+color: var(--secondary-text-color);
 }
 .alternatives {
 border-top: 1px solid var(--divider-color, rgba(127, 127, 127, 0.3));

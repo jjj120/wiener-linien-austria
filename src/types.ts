@@ -767,8 +767,17 @@ export interface RouteAttrs {
   trips?: RouteTripAttr[];
   line_colors?: LineColorsMap;
   traffic_info?: Array<{ title?: string; description?: string; related_lines?: string[] }>;
-  /** Lift outages at stations whose lifts the trips use; `stop_ids` names them. */
-  elevator_info?: Array<{ station?: string; description?: string; stop_ids?: string[] }>;
+  /** Lift outages at stations whose lifts the trips use; `stop_ids` names
+   *  them. `description` is the one lift the outage is about ("Passage -
+   *  Zwischengeschoss - Ausgang Innere Mariahilferstraße"), `reason` the
+   *  cause and usually the expected end date. Both German whatever the
+   *  dashboard's language: the feed publishes no other. */
+  elevator_info?: Array<{
+    station?: string;
+    description?: string;
+    reason?: string;
+    stop_ids?: string[];
+  }>;
   /** Planned step-free. */
   step_free?: boolean;
   /** Route entities, late evening: the night's last connection without a

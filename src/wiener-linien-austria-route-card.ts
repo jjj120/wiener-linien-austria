@@ -963,14 +963,25 @@ export class WienerLinienAustriaRouteCard extends LitElement {
 
   private _renderNotices(trip: RouteTripAttr, attrs: RouteAttrs): TemplateResult | typeof nothing {
     const lines = new Set(transitLegs(trip).map((leg) => leg.line ?? ""));
+    // Which lift, and why. The outage feed names one lift precisely
+    // ("Passage - Zwischengeschoss - Ausgang Innere Mariahilferstraße");
+    // the trip names its lifts by station alone, so the match below can
+    // only ever be station-wide. Printing the location is what lets
+    // someone see the outage is about an exit they never take — without
+    // it the notice reads as "the lift you need is out", which it often
+    // is not. `reason` usually carries the expected end date too.
     const lifts = this._liftOutages(trip, attrs).map((outage) => ({
       title: this._t("lift_out_notice", { station: outage.station ?? "" }),
+      detail: [outage.description, outage.reason]
+        .map((part) => (part ?? "").trim())
+        .filter(Boolean)
+        .join(" · "),
     }));
     const notices = [
       ...lifts,
-      ...(attrs.traffic_info ?? []).filter((n) =>
-        (n.related_lines ?? []).some((line) => lines.has(line)),
-      ),
+      ...(attrs.traffic_info ?? [])
+        .filter((n) => (n.related_lines ?? []).some((line) => lines.has(line)))
+        .map((n) => ({ title: n.title, detail: "" })),
     ].slice(0, MAX_NOTICES + lifts.length);
     if (!notices.length) return nothing;
     return html`
@@ -981,6 +992,7 @@ export class WienerLinienAustriaRouteCard extends LitElement {
               <ha-icon icon="mdi:alert-outline" aria-hidden="true"></ha-icon>
               <span>
                 <span class="sr-only">${this._t("disruption")}: </span>${n.title ?? ""}
+                ${n.detail ? html`<span class="notice-detail">${n.detail}</span>` : nothing}
               </span>
             </li>
           `,
@@ -1949,6 +1961,15 @@ export class WienerLinienAustriaRouteCard extends LitElement {
     .notice ha-icon {
       --mdc-icon-size: 18px;
       flex: none;
+    }
+    /* Which lift and why, under the station name. Its own line rather
+       than a longer first line: the station is what's scanned for, the
+       location is what's read once it has been found. */
+    .notice-detail {
+      display: block;
+      margin-top: 2px;
+      font-size: 0.8rem;
+      color: var(--secondary-text-color);
     }
 
     .alternatives {

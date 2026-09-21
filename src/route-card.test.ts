@@ -339,6 +339,43 @@ describe("step-free", () => {
     expect(root(el).querySelectorAll(".access--out")).toHaveLength(1);
   });
 
+  it("names which lift is out and why, not just the station", async () => {
+    // The feed is per lift, the trip names its lifts per station, so the
+    // match is station-wide. Printing the location is what tells someone
+    // the outage is about an exit they never take.
+    const attrs = {
+      ...ACTIVE,
+      step_free: true,
+      trips: [stepFreeTrip()],
+      traffic_info: [],
+      elevator_info: [
+        {
+          station: "Stephansplatz",
+          description: "Passage - Zwischengeschoss - Ausgang Kärntner Straße",
+          reason: "Geplante Wartung wird durchgeführt.",
+          stop_ids: ["60201320"],
+        },
+      ],
+    };
+    const el = await mount(hass("2026-09-14T05:50:00+00:00", attrs), { entity: ENTITY });
+    expect(text(el)).toContain(
+      "Aufzug außer Betrieb: Stephansplatz Passage - Zwischengeschoss - Ausgang Kärntner Straße · Geplante Wartung wird durchgeführt.",
+    );
+  });
+
+  it("leaves the notice at the station alone when the feed names no lift", async () => {
+    const attrs = {
+      ...ACTIVE,
+      step_free: true,
+      trips: [stepFreeTrip()],
+      traffic_info: [],
+      elevator_info: [{ station: "Stephansplatz", description: "", reason: "", stop_ids: ["60201320"] }],
+    };
+    const el = await mount(hass("2026-09-14T05:50:00+00:00", attrs), { entity: ENTITY });
+    expect(text(el)).toContain("Aufzug außer Betrieb: Stephansplatz");
+    expect(root(el).querySelector(".notice-detail")).toBeNull();
+  });
+
   it("sends step_free from the card config in ad-hoc mode", async () => {
     remember(WESTBAHNHOF, PRATERSTERN);
     const { h, callWS } = adhocHass();
