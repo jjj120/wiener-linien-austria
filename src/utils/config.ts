@@ -212,6 +212,7 @@ export interface NormalisedModernStop {
 
 export function normaliseLineDirections(
   raw: unknown,
+  preserveEmpty = false,
 ): Record<string, "H" | "R"> | undefined {
   if (!raw || typeof raw !== "object") return undefined;
   const out: Record<string, "H" | "R"> = {};
@@ -235,7 +236,7 @@ export function normaliseLineDirections(
       );
     }
   }
-  return Object.keys(out).length ? out : undefined;
+  return preserveEmpty || Object.keys(out).length ? out : undefined;
 }
 
 function normaliseStopEntry(raw: unknown): NormalisedModernStop | null {
@@ -510,8 +511,10 @@ export interface NormalisedRetroConfigValidated {
   //     normalisers only ever produce absence, and absence is what the
   //     renderers branch on.
   entity?: string | undefined;
-  direction: "H" | "R";
+  direction?: "H" | "R" | undefined;
   line?: string | undefined;
+  lines?: string[] | undefined;
+  line_directions?: Record<string, "H" | "R"> | undefined;
   show_platform: boolean;
   platform_side: RetroPlatformSide;
   show_station_name: boolean;
@@ -547,6 +550,8 @@ const RETRO_VALIDATED_KEYS: ReadonlySet<string> = new Set([
   "entity",
   "direction",
   "line",
+  "lines",
+  "line_directions",
   "show_platform",
   "platform_side",
   "show_station_name",
@@ -573,7 +578,19 @@ const RETRO_VALIDATED_KEYS: ReadonlySet<string> = new Set([
 ]);
 
 export function normaliseRetroConfig(raw: WienerLinienRetroCardConfig): NormalisedRetroConfig {
-  const direction = raw.direction === "R" ? "R" : "H";
+  // Legacy single-line configs retain their H default. Multi-line configs
+  // may deliberately leave direction unset to mean both directions.
+  const direction = raw.direction === "R" || raw.direction === "H"
+    ? raw.direction
+    : raw.lines !== undefined || raw.line_directions !== undefined
+      ? undefined
+      : "H";
+  const lines = Array.isArray(raw.lines)
+    ? raw.lines.filter((line): line is string => typeof line === "string" && line.length > 0)
+    : typeof raw.line === "string" && raw.line
+      ? [raw.line]
+      : undefined;
+  const lineDirections = normaliseLineDirections(raw.line_directions, true);
   const size: RetroSize = RETRO_SIZES.has(raw.size as RetroSize)
     ? (raw.size as RetroSize)
     : CARD_DEFAULTS.size.retro;
@@ -590,7 +607,9 @@ export function normaliseRetroConfig(raw: WienerLinienRetroCardConfig): Normalis
     type: raw.type || "custom:wiener-linien-austria-retro-card",
     entity: typeof raw.entity === "string" && raw.entity.startsWith("sensor.") ? raw.entity : undefined,
     direction,
-    line: typeof raw.line === "string" && raw.line ? raw.line : undefined,
+    line: lines?.[0],
+    lines,
+    line_directions: lineDirections,
     // asBool, not `?? true` — YAML is untyped, and `?? ` passes a
     // non-boolean straight through (`show_platform: 0` yielded `0`,
     // hiding the column, where modern and flap both yield `true`).

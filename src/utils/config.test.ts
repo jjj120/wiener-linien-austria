@@ -65,6 +65,16 @@ describe("normaliseRetroConfig — defaults", () => {
     );
   });
 
+  it("preserves multi-line filters and an explicit all-directions marker", () => {
+    const c = normaliseRetroConfig(
+      retro({ lines: ["U1", "U2", "U3"], line_directions: {} }),
+    );
+    expect(c.direction).toBeUndefined();
+    expect(c.lines).toEqual(["U1", "U2", "U3"]);
+    expect(c.line).toBe("U1");
+    expect(c.line_directions).toEqual({});
+  });
+
   it("accepts only sensor-domain entities", () => {
     expect(normaliseRetroConfig(retro({ entity: "sensor.wl" })).entity).toBe(
       "sensor.wl",

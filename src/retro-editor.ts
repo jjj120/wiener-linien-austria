@@ -1,20 +1,16 @@
 // Lovelace editor for the Wiener Linien Austria retro card (v2 editor system).
 //
 // Same three tabs, same order, same flat sections as the modern and flap
-// editors. Retro is the constrained case of the shared stop block: the card
-// renders exactly one line in one direction, so the block runs in
-// `singleLine` mode — the line filter behaves as a radio, there is no "both
-// directions" option and no per-line overrides.
+// editors. Retro is the single-stop case of the shared stop block: it can
+// still select multiple lines and configure their directions independently.
 //
 // v1 asked for direction and line as two ha-form dropdowns above a walk-time
 // table, which is a third affordance for a job the other two editors did with
 // chips. Routing retro through the same block is most of why the three editors
 // are now one thing configured three ways.
 //
-// Direction autocorrect (a stop that serves only one direction, with the saved
-// config pointing at the other) is kept from v1 and still runs in willUpdate,
-// not render — it dispatches config-changed, and Lit requires render() to be
-// side-effect-free.
+// Direction choices are not autocorrected from live departures: a direction
+// with no current service can still be a deliberate configuration.
 
 import {
   LitElement,
@@ -46,7 +42,6 @@ import type {
   HaFormSchema,
   HomeAssistant,
   LovelaceCardEditor,
-  WienerLinienAttrs,
   WienerLinienRetroCardConfig,
 } from "./types.js";
 import { fireEvent } from "./utils.js";
@@ -56,7 +51,6 @@ import {
 } from "./editor/editor-common.js";
 import { normaliseRetroConfig, type NormalisedRetroConfig } from "./utils/config.js";
 import { departureBoardOptions } from "./utils/entities.js";
-import { directionSurface, linesForDirection } from "./utils/departures.js";
 
 @customElement("wiener-linien-austria-retro-card-editor")
 export class WienerLinienAustriaRetroCardEditor
@@ -68,11 +62,6 @@ export class WienerLinienAustriaRetroCardEditor
   @state() private _config?: NormalisedRetroConfig;
   @state() private _tab: TabKey = "stops";
   @state() private _headerSide: HeaderSideKey = "header_left";
-
-  /** Coalesces direction-autocorrect runs so render storms (typing in another
-   *  field) don't queue multiple config-changed dispatches. Plain field, not
-   *  @state — render bookkeeping, not UI state. */
-  private _pendingDirectionFix = false;
 
   public setConfig(config: WienerLinienRetroCardConfig): void {
     this._config = normaliseRetroConfig(config);
@@ -90,20 +79,8 @@ export class WienerLinienAustriaRetroCardEditor
     return prev.states[eid] !== this.hass.states[eid];
   }
 
-  protected override willUpdate(changed: PropertyValues): void {
-    if (changed.has("_config") || changed.has("hass")) {
-      this._scheduleDirectionAutocorrect();
-    }
-  }
-
   private get _i18n(): EditorTranslators {
     return editorTranslators("retro", this.hass?.language);
-  }
-
-  private _attrs(eid: string | undefined): WienerLinienAttrs | undefined {
-    return eid
-      ? (this.hass?.states?.[eid]?.attributes as WienerLinienAttrs | undefined)
-      : undefined;
   }
 
   /** Assign `_config` BEFORE dispatching — see editor/editor-common.ts.
@@ -131,34 +108,38 @@ export class WienerLinienAustriaRetroCardEditor
     const cfg = this._config!;
     return {
       entity: cfg.entity ?? "",
-      lines: cfg.line ? [cfg.line] : [],
+      lines: cfg.lines,
       direction: cfg.direction,
+      line_directions: cfg.line_directions,
       walk_times: cfg.walk_times,
     };
   }
 
   private get _stopCallbacks(): StopBlockCallbacks {
     return {
-      // Radio behaviour: picking a line replaces the selection. Picking the
-      // selected line again clears it, which is what the chip's pressed state
-      // implies — the card then falls back to the first tracked line.
       toggleLine: (_eid, line) => {
         if (!this._config) return;
         const next = { ...this._config };
-        if (next.line === line) delete next.line;
-        else next.line = line;
+        const lines = new Set(next.lines ?? []);
+        if (lines.has(line)) lines.delete(line);
+        else lines.add(line);
+        if (lines.size) {
+          next.lines = [...lines];
+          next.line = next.lines[0];
+        } else {
+          delete next.lines;
+          delete next.line;
+        }
         this._commit(next);
       },
-      // Retro always renders one direction, so the block's "both" (null) is
-      // unreachable — singleLine suppresses that button — and per-line
-      // overrides never render, so `lineDirections` is ignored here.
       setDirections: (_eid, next) => {
-        if (!this._config || next.direction === null) return;
-        const cfg: NormalisedRetroConfig = { ...this._config, direction: next.direction };
-        // Re-pick the line if the saved one doesn't run in the new direction,
-        // so the user never lands on a coherent-looking but empty card.
-        const linesNow = linesForDirection(this._attrs(cfg.entity), next.direction);
-        if (!cfg.line || !linesNow.includes(cfg.line)) cfg.line = linesNow[0];
+        if (!this._config) return;
+        const cfg: NormalisedRetroConfig = { ...this._config };
+        if (next.direction === null) delete cfg.direction;
+        else cfg.direction = next.direction;
+        cfg.line_directions = Object.keys(next.lineDirections).length
+          ? next.lineDirections
+          : {};
         this._commit(cfg);
       },
       setWalkTime: (_eid, key, minutes) => {
@@ -242,7 +223,6 @@ export class WienerLinienAustriaRetroCardEditor
             {
               index: 1,
               total: 1,
-              singleLine: true,
               lineColorOverrides: {},
               t,
               et,
@@ -263,13 +243,9 @@ export class WienerLinienAustriaRetroCardEditor
     if (entity === this._config.entity) return;
 
     const next: NormalisedRetroConfig = { ...this._config, entity };
-    // The previous line is meaningless at a new stop. If the new stop is
-    // one-way, snap direction FIRST so the line is picked for a direction the
-    // stop actually serves — otherwise the line is chosen for the
-    // about-to-be-corrected direction and ends up stranded.
-    const avail = this._availableDirections(entity);
-    if (avail.size === 1) next.direction = avail.has("H") ? "H" : "R";
-    next.line = linesForDirection(this._attrs(entity), next.direction)[0];
+    delete next.line;
+    delete next.lines;
+    delete next.line_directions;
     this._commit(next);
   };
 
@@ -430,58 +406,6 @@ export class WienerLinienAustriaRetroCardEditor
         ],
       })}
     `;
-  }
-
-  /** Directions tracked at `entity`. Tracked-line keys win — once the user has
-   *  chosen which lines to follow in the integration's config flow, only
-   *  directions with at least one tracked line are offered; live departures are
-   *  the fallback for older sensor caches.
-   *
-   *  Shares `directionSurface` with the stop block, which is the point: this
-   *  method and the block's direction buttons used to answer the same question
-   *  from different data, so the editor could autocorrect to a direction whose
-   *  button the block had disabled. */
-  private _availableDirections(
-    entity: string | undefined = this._config?.entity,
-  ): ReadonlySet<"H" | "R"> {
-    return directionSurface(this._attrs(entity)).available;
-  }
-
-  /** When the entity serves only one direction AND the saved config disagrees,
-   *  dispatch a one-shot correction. No-op when both or neither direction has
-   *  data, so a cold sensor never rewrites a deliberate choice. */
-  private _scheduleDirectionAutocorrect(): void {
-    if (!this._config || this._pendingDirectionFix) return;
-    const avail = this._availableDirections();
-    if (avail.size !== 1) return;
-    const only = avail.has("H") ? "H" : "R";
-    if (this._config.direction === only) return;
-    this._pendingDirectionFix = true;
-    void Promise.resolve().then(() => {
-      try {
-        if (!this._config) return;
-        // Re-check after the async hop — the entity may have changed, and the
-        // new one may serve both directions again.
-        const still = this._availableDirections();
-        if (still.size !== 1) return;
-        const target = still.has("H") ? "H" : "R";
-        if (this._config.direction === target) return;
-        const next: NormalisedRetroConfig = { ...this._config, direction: target };
-        const linesNow = linesForDirection(this._attrs(next.entity), target);
-        if (!next.line || !linesNow.includes(next.line)) next.line = linesNow[0];
-        // Silently rewriting saved config is user-meaningful — their direction
-        // just changed under them.
-        console.info(
-          `[wiener-linien-austria-retro-card-editor] direction autocorrected to "${target}" for entity "${next.entity ?? ""}" — only one direction has live data`,
-        );
-        this._commit(next);
-      } finally {
-        // Clear AFTER the work: clearing at the top would let a rapid entity
-        // change queue a second correction against the same render frame and
-        // double-fire when both microtasks resolved.
-        this._pendingDirectionFix = false;
-      }
-    });
   }
 
   private _computeLabel = (field: { name: string }): string =>

@@ -795,7 +795,8 @@ export class WienerLinienAustriaRetroCard extends LitElement {
     const departures = Array.isArray(attrs.departures) ? attrs.departures : [];
     const matching = filterDepartures(departures, {
       direction: this._config.direction,
-      lines: this._config.line ? [this._config.line] : undefined,
+      lines: this._config.lines,
+      line_directions: this._config.line_directions,
       walk_times: this._config.walk_times,
       accessibility_only: this._config.accessibility_only,
     });
