@@ -495,8 +495,10 @@ export interface WienerLinienRetroCardConfig extends LovelaceCardConfig {
   // `?: T | undefined` throughout — see the optionality convention in
   // utils/config.ts.
   entity?: string | undefined;
-  direction?: "H" | "R" | undefined;
+  direction?: "H" | "R" | "" | undefined;
   line?: string | undefined;
+  lines?: string[] | undefined;
+  line_directions?: Record<string, "H" | "R"> | undefined;
   show_platform?: boolean | undefined;
   platform_side?: RetroPlatformSide | undefined;
   show_station_name?: boolean | undefined;

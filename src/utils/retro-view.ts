@@ -42,7 +42,8 @@ export function deriveRetroView(
 
   const matching = filterDepartures(departures, {
     direction: cfg.direction,
-    lines: cfg.line ? [cfg.line] : undefined,
+    lines: cfg.lines,
+    line_directions: cfg.line_directions,
     walk_times: cfg.walk_times,
     accessibility_only: cfg.accessibility_only,
   });

@@ -65,6 +65,24 @@ describe("deriveRetroView — row selection", () => {
     ).toBe(true);
   });
 
+  it("shows both directions for every selected line", () => {
+    const feed = attrs({
+      departures: [
+        dep({ line: "U1", direction: "H" }),
+        dep({ line: "U1", direction: "R" }),
+        dep({ line: "U2", direction: "H" }),
+        dep({ line: "U2", direction: "R" }),
+        dep({ line: "U3", direction: "H" }),
+        dep({ line: "U3", direction: "R" }),
+      ],
+    });
+    const view = deriveRetroView(
+      cfg({ lines: ["U1", "U2", "U3"], line_directions: {} }),
+      feed,
+    );
+    expect(view.matching).toHaveLength(6);
+  });
+
   it("survives a sensor with no departures attribute at all", () => {
     const v = deriveRetroView(cfg(), {} as WienerLinienAttrs);
     expect(v.rows).toEqual([]);

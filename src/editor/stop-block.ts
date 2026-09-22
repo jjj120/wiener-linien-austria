@@ -6,10 +6,8 @@
 // render. The editors supply a view of the saved stop plus mutation callbacks;
 // they don't decide what a direction button looks like.
 //
-// Retro is the constrained case: one line, one direction. It passes
-// `singleLine: true`, which turns the chip row into radio behaviour (picking a
-// chip replaces the selection rather than adding to it) and suppresses the
-// per-line override group, which is meaningless with one line.
+// Retro is the single-stop case: it can still use the shared multi-line and
+// per-line direction controls.
 
 import { html, nothing, type TemplateResult } from "lit";
 import { classMap } from "lit/directives/class-map.js";
@@ -441,6 +439,10 @@ function renderOverrides(
   const effective = effectiveLines(lines, picked);
   const lineDirs = stop.line_directions ?? {};
   const stopDir = stop.direction ?? null;
+  const explicitBoth =
+    stop.direction === undefined &&
+    stop.line_directions !== undefined &&
+    Object.keys(stop.line_directions).length === 0;
 
   /** What a line actually resolves to right now. A line with no override
    *  inherits the stop-wide value, and showing that inherited value is the
@@ -474,7 +476,7 @@ function renderOverrides(
         // disables the other. See DirectionSurface. Shared with the stop-wide
         // control above so the two can't answer this differently.
         const surface = directionSurface(attrs, line);
-        const cur = effectiveDir(line);
+        const cur = explicitBoth ? null : effectiveDir(line);
         const hasH = surface.available.has("H");
         const hasR = surface.available.has("R");
         const onlyOne = surface.oneWay !== null;
@@ -516,8 +518,8 @@ function renderOverrides(
               ${dirButton({
                 label: "",
                 icon: "mdi:swap-horizontal",
-                active: cur === null && !onlyOne,
-                disabled: onlyOne,
+                active: cur === null && (!onlyOne || explicitBoth),
+                disabled: onlyOne && !explicitBoth,
                 compact: true,
                 title: opts.t("dir_both"),
                 ariaLabel: aria(null),
