@@ -13,7 +13,7 @@ import { LINE_TYPE_METRO } from "./mot.js";
 import { filterDepartures } from "./departures.js";
 import { ROW_CAP } from "./card-vocabulary.js";
 import type { DepartureAttr, WienerLinienAttrs } from "../types.js";
-import type { NormalisedRetroConfig } from "./config.js";
+import { retroDirectionFilter, type NormalisedRetroConfig } from "./config.js";
 
 export interface RetroView {
   /** Departures the panel will paint, already filtered and capped. */
@@ -41,7 +41,7 @@ export function deriveRetroView(
   const departures = Array.isArray(attrs.departures) ? attrs.departures : [];
 
   const matching = filterDepartures(departures, {
-    direction: cfg.direction,
+    direction: retroDirectionFilter(cfg.direction),
     lines: cfg.lines,
     line_directions: cfg.line_directions,
     walk_times: cfg.walk_times,

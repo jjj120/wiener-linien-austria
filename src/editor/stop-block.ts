@@ -6,8 +6,10 @@
 // render. The editors supply a view of the saved stop plus mutation callbacks;
 // they don't decide what a direction button looks like.
 //
-// Retro is the single-stop case: it can still use the shared multi-line and
-// per-line direction controls.
+// Retro is the single-stop case, not a constrained one: it renders the same
+// multi-line chips and per-line direction rows as the others, and differs only
+// in having no `remove` callback — dropping its only stop would leave an
+// unrenderable card.
 
 import { html, nothing, type TemplateResult } from "lit";
 import { classMap } from "lit/directives/class-map.js";
@@ -71,8 +73,6 @@ export interface StopBlockOptions {
   /** Total stops — the index pill is suppressed when there is only one, since
    *  numbering a list of one is noise. */
   total: number;
-  /** Retro: chips are radio, no per-line overrides. */
-  singleLine?: boolean;
   /** Per-line colour overrides from the card config. */
   lineColorOverrides: Record<string, string>;
   /** Card-namespaced translator (`dir_h`, `dir_both`, `entity_missing`, …). */
@@ -129,13 +129,10 @@ function terminiFor(
 
 /** Per-line rows replace the stop-wide control once two or more lines are in
  *  play. Below that the stop-wide control is the only direction picker there
- *  is — which is the whole of retro's model, so it can never be dropped
- *  outright. */
+ *  is, so it can never be dropped outright. */
 function showPerLineDirections(
-  opts: StopBlockOptions,
   ctx: { lines: string[]; picked: Set<string> },
 ): boolean {
-  if (opts.singleLine) return false;
   return effectiveLines(ctx.lines, ctx.picked).length >= 2;
 }
 
@@ -195,7 +192,7 @@ export function renderStopBlock(
             // once read as contradicting each other (the stop-wide row says R
             // while a line row says H), and the stop-wide label degrades into
             // soup at a hub because it pools termini across every line.
-            showPerLineDirections(opts, { lines, picked })
+            showPerLineDirections({ lines, picked })
             ? renderOverrides(stop, opts, cb, { attrs, triplets, picked, lines, colorOf, dirStrings })
             : renderDirection(stop, opts, cb, { attrs, triplets, picked, lines, dirStrings })
           : nothing}
@@ -256,12 +253,9 @@ function renderLines(
       ${lines.length
         ? html`<div class="wl-chips">
             ${lines.map((line) => {
-              // Empty selection means "all lines" on multi-line cards, so every
-              // chip reads as active. Retro always has exactly one line
-              // selected, so an empty set there means nothing is chosen yet.
-              const on = opts.singleLine
-                ? picked.has(line)
-                : picked.size === 0 || picked.has(line);
+              // Empty selection means "all lines", so every chip reads as
+              // active — that is what no filter actually shows.
+              const on = picked.size === 0 || picked.has(line);
               const icon = lineTypeIcon(typeByLine.get(line));
               return html`<button
                 type="button"
@@ -311,9 +305,8 @@ function renderDirection(
   const scope = effective.length === 1 ? effective[0] : undefined;
   const dir = stop.direction ?? null;
   // Same three-state surface the per-line rows use — see DirectionSurface.
-  // This control is the ONLY direction picker retro has (singleLine
-  // suppresses "both"), so getting the empty case wrong disabled every
-  // button it owns.
+  // This control is the only direction picker until a second line is in play,
+  // so getting the empty case wrong disabled every button it owns.
   const surface: DirectionSurface = directionSurface(attrs, scope);
   const hasH = surface.available.has("H");
   const hasR = surface.available.has("R");
@@ -370,15 +363,13 @@ function renderDirection(
             : opts.et("direction_unavailable"),
           onClick: () => commit("R"),
         })}
-        ${opts.singleLine
-          ? nothing
-          : dirButton({
-              label: opts.t("dir_both"),
-              active: activeBoth,
-              disabled: onlyOne,
-              title: onlyOne ? opts.et("direction_unavailable") : opts.t("dir_both"),
-              onClick: () => commit(null),
-            })}
+        ${dirButton({
+          label: opts.t("dir_both"),
+          active: activeBoth,
+          disabled: onlyOne,
+          title: onlyOne ? opts.et("direction_unavailable") : opts.t("dir_both"),
+          onClick: () => commit(null),
+        })}
       </div>
       ${note ? html`<span class="wl-note">${note}</span>` : nothing}
     </div>
@@ -439,10 +430,6 @@ function renderOverrides(
   const effective = effectiveLines(lines, picked);
   const lineDirs = stop.line_directions ?? {};
   const stopDir = stop.direction ?? null;
-  const explicitBoth =
-    stop.direction === undefined &&
-    stop.line_directions !== undefined &&
-    Object.keys(stop.line_directions).length === 0;
 
   /** What a line actually resolves to right now. A line with no override
    *  inherits the stop-wide value, and showing that inherited value is the
@@ -476,7 +463,7 @@ function renderOverrides(
         // disables the other. See DirectionSurface. Shared with the stop-wide
         // control above so the two can't answer this differently.
         const surface = directionSurface(attrs, line);
-        const cur = explicitBoth ? null : effectiveDir(line);
+        const cur = effectiveDir(line);
         const hasH = surface.available.has("H");
         const hasR = surface.available.has("R");
         const onlyOne = surface.oneWay !== null;
@@ -518,8 +505,8 @@ function renderOverrides(
               ${dirButton({
                 label: "",
                 icon: "mdi:swap-horizontal",
-                active: cur === null && (!onlyOne || explicitBoth),
-                disabled: onlyOne && !explicitBoth,
+                active: cur === null && !onlyOne,
+                disabled: onlyOne,
                 compact: true,
                 title: opts.t("dir_both"),
                 ariaLabel: aria(null),

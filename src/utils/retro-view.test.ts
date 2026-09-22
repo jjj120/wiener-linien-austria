@@ -77,7 +77,7 @@ describe("deriveRetroView — row selection", () => {
       ],
     });
     const view = deriveRetroView(
-      cfg({ lines: ["U1", "U2", "U3"], line_directions: {} }),
+      cfg({ lines: ["U1", "U2", "U3"], direction: "both" }),
       feed,
     );
     expect(view.matching).toHaveLength(6);

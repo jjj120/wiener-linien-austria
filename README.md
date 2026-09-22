@@ -206,11 +206,12 @@ entities:
 
 ### Retro card — `wiener-linien-austria-retro-card`
 
-A focused LED panel, modelled on the amber-on-violet signs hanging from Wiener Linien platforms. The station-name tile picks up the configured line's colour (nightline blue + yellow on N-lines).
+A focused LED panel, modelled on the amber-on-violet signs hanging from Wiener Linien platforms. Filter it to one line and the station-name tile picks up that line's colour (nightline blue + yellow on N-lines).
 
 - **Three style variants** — *Classic*, *Warm*, *Dot matrix* (screen-door overlay).
 - **GLEIS / STEIG panel** — amber platform tile when the API reports one.
 - **Signage header strip** — exit icon, sign text, clock, date, WC / escalator / elevator tiles, free-form MDI icons and short labels. Per side.
+- **Several lines at once** — track any set of lines on one panel, each with its own direction, or show every direction *(2.1.0)*.
 - **Wheelchair race** — when ≥ 2 departures are step-free, runs a "3, 2, 1" countdown to the trophy finish. Tap to trigger.
 - **Scrolling message** — custom text scrolls every 5 min, then hands back to live departures.
 
@@ -221,15 +222,17 @@ Add via Dashboard → **Add card** → "Wiener Linien Austria — Retro".
 ```yaml
 type: custom:wiener-linien-austria-retro-card
 entity: sensor.stephansplatz_departures
-line: U1
-direction: R
+lines: [U1, U4]
+direction: both
 ```
 
 | Option | Default | Description |
 |---|---|---|
 | `entity` | first stop found | A stop's departure sensor. |
-| `line` | all lines | The line to show. |
-| `direction` | `H` | `H` or `R`. |
+| `lines` | all lines | The lines to show, for example `[U1, U4]`. |
+| `line` | all lines | A single line. The older spelling of `lines`, still read. |
+| `direction` | `H` | `H`, `R`, or `both` for every direction. |
+| `line_directions` | none | One direction per line, for example `{U1: R}`. Beats `direction` for that line. |
 | `walk_times` | none | Minutes it takes you to reach the line, keyed `"line\|direction"`, `0`–`120`. Departures you can't catch are hidden. |
 | `size` | `regular` | `small`, `medium` or `regular`. |
 | `style` | `classic` | `classic`, `warm` or `pixel` (dot matrix). |

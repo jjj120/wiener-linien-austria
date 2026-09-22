@@ -65,14 +65,43 @@ describe("normaliseRetroConfig — defaults", () => {
     );
   });
 
-  it("preserves multi-line filters and an explicit all-directions marker", () => {
+  it("preserves a multi-line filter and an explicit both-directions choice", () => {
     const c = normaliseRetroConfig(
-      retro({ lines: ["U1", "U2", "U3"], line_directions: {} }),
+      retro({ lines: ["U1", "U2", "U3"], direction: "both" }),
     );
-    expect(c.direction).toBeUndefined();
+    expect(c.direction).toBe("both");
     expect(c.lines).toEqual(["U1", "U2", "U3"]);
+    // `line` is re-emitted as lines[0] so a config written here still loads
+    // on a build that predates multi-line support.
     expect(c.line).toBe("U1");
-    expect(c.line_directions).toEqual({});
+    expect(c.line_directions).toBeUndefined();
+  });
+
+  // The back-compat rule the "both" spelling exists to protect: a card saved
+  // before multi-line support omits `direction` and has always meant H. If
+  // absence were read as "every direction", every one of those cards would
+  // silently start showing the opposite direction too.
+  it("still reads a missing direction as H, and widens `line` into `lines`", () => {
+    const c = normaliseRetroConfig(retro({ line: "U4" }));
+    expect(c.direction).toBe("H");
+    expect(c.lines).toEqual(["U4"]);
+    expect(c.line).toBe("U4");
+  });
+
+  it("round-trips its own output unchanged", () => {
+    // The editor commits normalised objects straight to the saved config, so
+    // normalise(normalise(x)) must equal normalise(x) — otherwise reopening a
+    // card rewrites the user's choice.
+    const once = normaliseRetroConfig(
+      retro({ lines: ["U1", "U2"], direction: "both", line_directions: { U1: "R" } }),
+    );
+    expect(normaliseRetroConfig(once)).toEqual(once);
+  });
+
+  it("drops a lines array that normalises to nothing", () => {
+    const c = normaliseRetroConfig(retro({ lines: ["", "  ".trim()] }));
+    expect(c.lines).toBeUndefined();
+    expect(c.line).toBeUndefined();
   });
 
   it("accepts only sensor-domain entities", () => {

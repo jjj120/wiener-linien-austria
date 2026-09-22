@@ -237,6 +237,22 @@ describe("rendering", () => {
     const el = await mount(tag, busyHass(), config);
     expect(el.getCardSize()).toBeGreaterThan(0);
   });
+
+  it("the retro card blames the line filter, not the direction, on a both-directions board", async () => {
+    // A board set to every direction filters nothing by direction, so an empty
+    // result can only be the line filter. Reading "both" as a value to compare
+    // each departure against matches nothing, which sent every empty
+    // multi-line board to "wrong direction" instead.
+    const el = await mount(RETRO, busyHass(), {
+      type: `custom:${RETRO}`,
+      entity: ENTITY,
+      lines: ["U6"],
+      direction: "both",
+    });
+    const empty = shadow(el).querySelector(".retro-empty");
+    expect(empty?.textContent?.trim()).toBe("Keine Abfahrten für diese Linie");
+  });
+
 });
 
 /** A stop with a live U3 on either side of a planned S-Bahn train. */

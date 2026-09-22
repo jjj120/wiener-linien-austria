@@ -21,7 +21,12 @@ import type {
   WienerLinienAttrs,
   WienerLinienRetroCardConfig,
 } from "./types.js";
-import { chipPalette, normaliseRetroConfig, type NormalisedRetroConfig } from "./utils/config.js";
+import {
+  chipPalette,
+  normaliseRetroConfig,
+  retroDirectionFilter,
+  type NormalisedRetroConfig,
+} from "./utils/config.js";
 import { filterDepartures, stubDirection } from "./utils/departures.js";
 import { deriveRetroView } from "./utils/retro-view.js";
 import { findWienerLinienEntities } from "./utils/entities.js";
@@ -924,7 +929,7 @@ export class WienerLinienAustriaRetroCard extends LitElement {
     const attrs = (this.hass.states[eid]?.attributes ?? {}) as WienerLinienAttrs;
     const departures = Array.isArray(attrs.departures) ? attrs.departures : [];
     const matching = filterDepartures(departures, {
-      direction: this._config.direction,
+      direction: retroDirectionFilter(this._config.direction),
       lines: this._config.lines,
       line_directions: this._config.line_directions,
       walk_times: this._config.walk_times,
@@ -963,7 +968,10 @@ export class WienerLinienAustriaRetroCard extends LitElement {
           departures,
           cfg.station_bg,
           attrs.line_colors ?? {},
-          cfg.line,
+          // Only a single-line board has "the" configured line. With several
+          // selected, lines[0] would tint the whole tile for whichever line
+          // happened to be picked first, so defer to the live rows instead.
+          cfg.lines?.length === 1 ? cfg.lines[0] : undefined,
         )
       : nothing;
     // Master gate — when `show_header` is off (the default), the
@@ -1104,8 +1112,14 @@ export class WienerLinienAustriaRetroCard extends LitElement {
       // responding (server_time present) but the stop has nothing left,
       // that's end-of-service, not a data outage.
       const dir = this._config!.direction;
-      const lineFilter = this._config!.line;
-      const inDirection = allDepartures.filter((d) => d.direction === dir);
+      // "both" filters nothing, so every departure counts as in-direction.
+      // Comparing d.direction against it would match none of them and send
+      // every empty multi-line board to "wrong direction".
+      const inDirection =
+        dir === "both"
+          ? allDepartures
+          : allDepartures.filter((d) => d.direction === dir);
+      const hasLineFilter = (this._config!.lines?.length ?? 0) > 0;
       let key = "no_data";
       if (allDepartures.length === 0 && staleDropped > 0) {
         // Upstream froze: records arrived but had stopped advancing, so
@@ -1117,7 +1131,7 @@ export class WienerLinienAustriaRetroCard extends LitElement {
         key = "betriebsschluss";
       } else if (allDepartures.length > 0 && inDirection.length === 0) {
         key = "no_data_wrong_direction";
-      } else if (lineFilter && inDirection.length > 0) {
+      } else if (hasLineFilter && inDirection.length > 0) {
         key = "no_data_wrong_line";
       }
       return html`<div class="retro-empty" role="status" aria-live="polite">${this._t(key)}</div>`;
@@ -1277,13 +1291,13 @@ export class WienerLinienAustriaRetroCard extends LitElement {
       // numerals so N-prefix tiles match the in-station NightLine
       // signage.
       //
-      // Source-line precedence: configured cfg.line wins over live
-      // departures so a nightline configured during the day still
-      // tints the panel in nightline-blue (no live U-Bahn rows would
-      // otherwise overwrite it with U-Bahn-red). Falls back to the
-      // first live departure when no line is configured. Final fall-
-      // through is white — chipPalette's `var(--primary-color)` floor
-      // reads poorly on the LED aesthetic.
+      // Source-line precedence: a board filtered to ONE line uses that
+      // line, so a nightline configured during the day still tints the
+      // panel in nightline-blue (no live U-Bahn rows would otherwise
+      // overwrite it with U-Bahn-red). With no filter or several lines
+      // there is no single right answer, so the first live departure
+      // wins. Final fall-through is white — chipPalette's
+      // `var(--primary-color)` floor reads poorly on the LED aesthetic.
       const pool = matching.length ? matching : allDepartures;
       const sourceLine = configuredLine || pool[0]?.line;
       if (sourceLine) {

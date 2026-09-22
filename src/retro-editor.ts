@@ -109,7 +109,10 @@ export class WienerLinienAustriaRetroCardEditor
     return {
       entity: cfg.entity ?? "",
       lines: cfg.lines,
-      direction: cfg.direction,
+      // The block spells "both directions" as absence, the same as it does
+      // for the modern and flap editors. Our config spells it "both", so the
+      // translation happens here and nowhere else.
+      direction: cfg.direction === "both" ? undefined : cfg.direction,
       line_directions: cfg.line_directions,
       walk_times: cfg.walk_times,
     };
@@ -134,12 +137,18 @@ export class WienerLinienAustriaRetroCardEditor
       },
       setDirections: (_eid, next) => {
         if (!this._config) return;
-        const cfg: NormalisedRetroConfig = { ...this._config };
-        if (next.direction === null) delete cfg.direction;
-        else cfg.direction = next.direction;
-        cfg.line_directions = Object.keys(next.lineDirections).length
-          ? next.lineDirections
-          : {};
+        // The block's null is "both"; persist that as the explicit value so
+        // reopening the card doesn't read it back as an omission and snap to
+        // the legacy H default.
+        const cfg: NormalisedRetroConfig = {
+          ...this._config,
+          direction: next.direction ?? "both",
+        };
+        if (Object.keys(next.lineDirections).length) {
+          cfg.line_directions = next.lineDirections;
+        } else {
+          delete cfg.line_directions;
+        }
         this._commit(cfg);
       },
       setWalkTime: (_eid, key, minutes) => {

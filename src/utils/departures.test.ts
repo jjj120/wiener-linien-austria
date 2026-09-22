@@ -299,8 +299,8 @@ describe("directionSurface — unknown is not 'not served'", () => {
 
   // The regression that motivated the whole helper: a tracked nightline has no
   // live departures in the afternoon, and reading that as "not served" left its
-  // direction buttons disabled — permanently, for a retro card, since the block
-  // suppresses the "both" button in singleLine mode.
+  // direction buttons disabled — permanently, on a card whose only stop is that
+  // one, since there is no other line to fall back to.
   it("keeps a tracked line's directions alive with no live departures", () => {
     const s = directionSurface(
       attrs({ tracked_line_keys: ["N25|H", "N25|R"], departures: [] }),

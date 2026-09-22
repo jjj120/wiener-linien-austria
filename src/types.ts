@@ -424,6 +424,12 @@ export type RetroStyle = "classic" | "warm" | "pixel";
  *  mirror a real station view that disagrees with the heuristic. */
 export type RetroPlatformSide = "auto" | "left" | "right";
 
+/** Retro direction filter. "both" is the explicit all-directions choice —
+ *  spelled out rather than encoded as absence, because absence already
+ *  means something else here: a pre-multi-line config that omits
+ *  `direction` has always shown H, and must keep doing so. */
+export type RetroDirection = "H" | "R" | "both";
+
 /** Exit-icon variant for one side of the station header strip.
  *  Either `"none"` (suppresses the icon), one of the two WL-traced
  *  signage glyphs (`"regular"` / `"accessible"`), or an MDI icon
@@ -495,7 +501,10 @@ export interface WienerLinienRetroCardConfig extends LovelaceCardConfig {
   // `?: T | undefined` throughout — see the optionality convention in
   // utils/config.ts.
   entity?: string | undefined;
-  direction?: "H" | "R" | "" | undefined;
+  direction?: RetroDirection | undefined;
+  /** Legacy single-line filter. Still read (and still written, as
+   *  `lines[0]`) so configs written before multi-line support keep
+   *  working; `lines` is the one to set. */
   line?: string | undefined;
   lines?: string[] | undefined;
   line_directions?: Record<string, "H" | "R"> | undefined;
